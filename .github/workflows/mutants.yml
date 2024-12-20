@@ -23,4 +23,4 @@ jobs:
       - name: Install cargo mutants
         run: cargo install cargo-mutants
       - name: Mutants
-        run: cd arcshift && ./run_mutants.sh
+        run: ./run_mutants.sh
