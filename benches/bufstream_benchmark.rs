@@ -1,4 +1,4 @@
-use bufstream2::BufStream;
+use buf_read_write::BufStream;
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::io::{BufReader, BufWriter, Cursor, Read, Write};
 
@@ -23,21 +23,21 @@ fn many_small_writes_bufwriter() -> BufWriter<Cursor<Vec<u8>>> {
 }
 
 fn many_small_reads_bufstream() -> BufStream<Cursor<Vec<u8>>> {
-    let v = vec![42u8; 100];
+    let v = vec![42u8; 400];
     let mut bufstream = BufStream::new(Cursor::new(v));
 
-    for i in 0..100 {
-        bufstream.read(&mut [0]).unwrap();
+    for _i in 0..100 {
+        bufstream.read(&mut [0,1,2,3]).unwrap();
     }
     bufstream
 }
 
 fn many_small_reads_bufreader() -> BufReader<Cursor<Vec<u8>>> {
-    let v = vec![42u8; 100];
+    let v = vec![42u8; 400];
     let mut bufstream = BufReader::new(Cursor::new(v));
 
-    for i in 0..100 {
-        bufstream.read(&mut [0]).unwrap();
+    for _i in 0..100 {
+        bufstream.read(&mut [0,1,2,3]).unwrap();
     }
     bufstream
 }

@@ -1,4 +1,4 @@
-//! # bufstream2
+//! # buf_read_write
 //!
 //! This crate contains the [`BufStream`] struct, a combination of [`std::io::BufReader`]
 //! and [`std::io::BufWriter`].
@@ -32,8 +32,8 @@
 //!   reading, will invalidate the buffer (writing it back correctly to the backing
 //!   implementation).
 //!
-//! * Bufstream2 is not a disk cache. Reads and writes larger than the buffer size will
-//!   be satisfied by bypassing the buffer. The purpose of Bufstream2 is only to provide
+//! * buf_read_write is not a disk cache. Reads and writes larger than the buffer size will
+//!   be satisfied by bypassing the buffer. The purpose of buf_read_write is only to provide
 //!   acceptable performance when doing small reads/writes.
 //!
 //! * Buffered reads assume the file is being traversed forward. Reading position 2000
@@ -62,7 +62,16 @@
 //!
 //! * No unsafe code is used
 //!
-//! * Bufstream2 has no dependencies (apart from dev-dependencies)
+//! * buf_read_write has no dependencies (apart from dev-dependencies)
+//!
+//! * Note that when mixing writes, reads and seeks, the buffer will be reused.
+//!   The dirty region of the buffer is tracked using a simple range. A consequence of this
+//!   is that if a large chunk is read, and a single byte is modified at the head and tail
+//!   of this chunk, when the buffer is flushed, the entire buffer will be written to the
+//!   backing implementation.
+//!   For disk IO, this can be acceptable, since writing a whole buffer may be equally
+//!   fast as writing two smaller buffers. If this behavior is not desired, consider
+//!   flushing the buffer between writes.
 //!
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
@@ -78,6 +87,7 @@ const DEFAULT_BUF_SIZE: usize = 8192;
 #[derive(Clone, Debug)]
 struct MovingBuffer {
     offset: u64,
+    dirty: Range<usize>,
     data: Vec<u8>,
 }
 
@@ -86,7 +96,7 @@ struct MovingBuffer {
 macro_rules! debug_println {
     ($f:expr, $($a:expr),+) => {{
         // Enable this if you need to debug
-        // println!($f, $($a),+ );
+        //println!($f, $($a),+ );
     }};
 }
 
@@ -147,10 +157,15 @@ impl Drop for DropGuard<'_> {
     }
 }
 
+fn union(range: &mut Range<usize>, rhs: Range<usize>) {
+    *range = range.start.min(rhs.start)..range.end.max(rhs.end);
+}
+
 impl MovingBuffer {
     fn with_capacity(capacity: usize) -> Self {
         Self {
             data: Vec::with_capacity(capacity),
+            dirty: 0..0,
             offset: 0,
         }
     }
@@ -161,8 +176,9 @@ impl MovingBuffer {
         flusher: &mut impl FnMut(u64, &[u8]) -> Result<(), std::io::Error>,
     ) -> Result<(), std::io::Error> {
         if !self.data.is_empty() {
-            flusher(self.offset, &self.data)?;
+            flusher(self.offset+self.dirty.start as u64, &self.data[self.dirty.clone()])?;
         }
+        self.dirty = 0..0;
         self.data.clear();
         Ok(())
     }
@@ -175,29 +191,31 @@ impl MovingBuffer {
         &mut self,
         position: u64,
         data: &[u8],
-        write_at: &mut impl FnMut(u64, &[u8]) -> Result<(), std::io::Error>,
+        write_back: &mut impl FnMut(u64, &[u8]) -> Result<(), std::io::Error>,
     ) -> Result<(), std::io::Error> {
         // The following cannot overflow, because of how Vec works.
         let free_capacity = self.data.capacity() - self.data.len();
-
         if position == self.end()? && free_capacity >= data.len() {
+            union(&mut self.dirty, self.data.len()..self.data.len()+data.len());
             self.data.extend(data);
             Ok(())
         } else if position >= self.offset && checked_add(position, data.len())? <= self.end()? {
             let relative_offset = to_usize(checked_sub_u64(position, self.offset)?)?;
-            self.data[relative_offset..checked_add_usize(relative_offset, data.len())?]
+            let end = checked_add_usize(relative_offset, data.len())?;
+            self.data[relative_offset..end]
                 .copy_from_slice(data);
-
+            union(&mut self.dirty, relative_offset..end);
             Ok(())
         } else {
-            self.flush(write_at)?;
+            self.flush(write_back)?;
             self.data.clear();
             if data.len() < self.data.capacity() {
                 self.offset = position;
+                union(&mut self.dirty, self.data.len()..self.data.len()+data.len());
                 self.data.extend(data);
                 Ok(())
             } else {
-                write_at(position, data)?;
+                write_back(position, data)?;
                 Ok(())
             }
         }
@@ -358,7 +376,6 @@ impl<T: Read + Write + Seek + std::fmt::Debug> BufRead for BufStream<T> {
         dropguard.0.truncate(got);
         self.inner_position = checked_add(self.position, got)?;
         forget(dropguard);
-        dbg!(got);
         Ok(&self.buffer.data)
     }
 
@@ -400,9 +417,10 @@ impl<T: Write + Seek> Write for BufStream<T> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let free_capacity = self.buffer.data.capacity() - self.buffer.data.len();
         if self.position == self.buffer.offset + self.buffer.data.len() as u64
-            && free_capacity >= buf.len()
+            && free_capacity >= buf.len() && self.buffer.dirty.end == self.buffer.data.len()
         {
             self.buffer.data.extend(buf);
+            self.buffer.dirty.end += buf.len();
             self.position = checked_add(self.position, buf.len())?;
             return Ok(buf.len());
         }
@@ -431,8 +449,18 @@ impl<T: Write + Seek> BufStream<T> {
         t?;
         Ok(())
     }
+}
 
-    /// Crate a new instance, with the given buffer size
+impl<T> BufStream<T> {
+
+    /// Crate a new instance, wrapping `inner`, with the given buffer size.
+    ///
+    /// Note:
+    ///
+    /// * To be able to write, `inner` must implement [`Write`] and [`Seek`].
+    /// * To be able to read, `inner` must implement [`Read`], [`Write`] and [`Seek`].
+    ///   The reason for this is that reading may require invalidating the buffer, which
+    ///   may require flushing.
     pub fn with_capacity(inner: T, capacity: usize) -> Self {
         Self {
             buffer: MovingBuffer::with_capacity(capacity),
@@ -442,7 +470,14 @@ impl<T: Write + Seek> BufStream<T> {
         }
     }
 
-    /// Crate an instance with a default buffer size
+    /// Crate a new instance, wrapping `inner`, with a default buffer size.
+    ///
+    /// Note:
+    ///
+    /// * To be able to write, `inner` must implement [`Write`] and [`Seek`].
+    /// * To be able to read, `inner` must implement [`Read`], [`Write`] and [`Seek`].
+    ///   The reason for this is that reading may require invalidating the buffer, which
+    ///   may require flushing.
     pub fn new(inner: T) -> Self {
         Self::with_capacity(inner, DEFAULT_BUF_SIZE)
     }
@@ -515,17 +550,25 @@ impl<T: Read + Seek + Write> BufStream<T> {
 }
 
 impl<T: Read + Seek + Write> Read for BufStream<T> {
+    #[inline]
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(offset) = self.position.checked_sub(self.buffer.offset) {
-            if (offset as u64) < self.buffer.data.len().saturating_sub(buf.len()) as u64 {
-                let offset = offset as usize;
-                buf.copy_from_slice(&self.buffer.data[offset..offset + buf.len()]);
+        let offset = self.position.wrapping_sub(self.buffer.offset);
 
-                self.position = checked_add(self.position, buf.len())?;
+        let buflen = buf.len();
+        if offset < self.buffer.data.len().saturating_sub(buflen) as u64 {
+            let offset = offset as usize;
 
-                return Ok(buf.len());
+            buf.copy_from_slice(&self.buffer.data[offset..offset + buflen]);
+
+            if size_of::<usize>() > size_of::<u64>() {
+                self.position += to_u64(buflen)?;
+            } else {
+                self.position += buflen as u64;
             }
+
+            return Ok(buflen);
         }
+
         self.read_cold(buf)
     }
 }
@@ -937,8 +980,6 @@ mod tests {
                     if bufread {
                         cut_got = catch(&mut || {
                             let cutbuflen = cutbuf.len();
-                            dbg!(&cut);
-                            dbg!(cutbuflen);
                             let fillbuf = cut.fill_buf()?;
                             let data = &fillbuf[0..cutbuflen.min(fillbuf.len())];
                             cutbuf[0..data.len()].copy_from_slice(data);

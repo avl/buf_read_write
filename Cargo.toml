@@ -3,12 +3,11 @@ name = "buf_read_write"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
-repository = "https://github.com/avl/bufstream2"
-description = "Buffered reader + writer. Like BufWriter and BufReader combined into one."
+repository = "https://github.com/avl/buf_read_write"
+description = "Buffered IO. Like BufWriter and BufReader combined into one, with Seek-support."
 license = "MIT"
 
 [dependencies]
-
 
 [dev-dependencies]
 rand = { version = "0.8", features = ["small_rng"] }

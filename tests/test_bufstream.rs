@@ -1,4 +1,4 @@
-use bufstream2::BufStream;
+use buf_read_write::BufStream;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
