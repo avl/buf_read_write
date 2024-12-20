@@ -18,7 +18,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Install nightly
-      run: rustup toolchain install nightly && rustup toolchain install stable && rustup toolchain install 1.74
+      run: rustup toolchain install nightly && rustup toolchain install stable && rustup toolchain install 1.70
     - name: Build (nightly)
       run: cargo +nightly build --release
     - name: Run tests (nightly)

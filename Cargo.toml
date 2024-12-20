@@ -1,5 +1,5 @@
 [package]
-name = "bufstream2"
+name = "buf_read_write"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
