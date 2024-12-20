@@ -229,7 +229,6 @@ impl MovingBuffer {
     }
 }
 
-
 /// Buffering reader/writer
 /// See crate documentation.
 #[derive(Debug)]
@@ -252,7 +251,6 @@ impl<T> BufStream<T> {
         }
     }
 }
-
 
 const DEFAULT_BUF_SIZE: usize = 8192;
 
@@ -366,10 +364,10 @@ impl<T: Read + Seek + Write> Read for BufStream<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::panic;
-    use std::panic::{AssertUnwindSafe};
     use super::*;
     use rand::{Rng, RngCore};
+    use std::panic;
+    use std::panic::AssertUnwindSafe;
 
     #[derive(Default, PartialEq, Eq, Debug, Clone)]
     struct FakeStream {
@@ -613,7 +611,7 @@ mod tests {
     fn writes_are_buffered() {
         let cut_inner = FakeStream::default();
         let mut cut = BufStream::with_capacity(cut_inner, 100);
-        cut.write(&[1,2,3]).unwrap();
+        cut.write(&[1, 2, 3]).unwrap();
         assert!(cut.inner.buf.is_empty());
     }
 
@@ -621,77 +619,73 @@ mod tests {
     fn writes_are_buffered_after_seek() {
         let cut_inner = FakeStream::default();
         let mut cut = BufStream::with_capacity(cut_inner, 100);
-        cut.write(&[1,2,3]).unwrap();
+        cut.write(&[1, 2, 3]).unwrap();
         cut.seek(SeekFrom::Start(10)).unwrap();
-        cut.write(&[4,5,6]).unwrap();
-        assert_eq!(cut.inner.buf, [1,2,3]); //This should have been flushed
+        cut.write(&[4, 5, 6]).unwrap();
+        assert_eq!(cut.inner.buf, [1, 2, 3]); //This should have been flushed
 
-        assert_eq!(cut.buffer.data, [4,5,6]); //This should have been flushed
-        assert_eq!(cut.buffer.offset,10); //This should have been flushed
+        assert_eq!(cut.buffer.data, [4, 5, 6]); //This should have been flushed
+        assert_eq!(cut.buffer.offset, 10); //This should have been flushed
     }
 
     #[test]
     fn reads_are_buffered() {
         let cut_inner = FakeStream::default();
         let mut cut = BufStream::with_capacity(cut_inner, 100);
-        cut.write(&[1,2,3,4,5]).unwrap();
+        cut.write(&[1, 2, 3, 4, 5]).unwrap();
         cut.seek(SeekFrom::Start(0)).unwrap();
-        let mut temp = [0,0,0];
+        let mut temp = [0, 0, 0];
         cut.read(&mut temp).unwrap();
-        assert_eq!(temp, [1,2,3]);
+        assert_eq!(temp, [1, 2, 3]);
 
         cut.inner.buf.clear(); //Clear the inner buf
 
         cut.seek(SeekFrom::Start(1)).unwrap();
-        let mut temp2 = [0,0];
+        let mut temp2 = [0, 0];
         cut.read(&mut temp2).unwrap(); //This can now only succeed from the buffer
 
-        assert_eq!(temp2, [2,3]); //If this succeeds, reads are buffered
+        assert_eq!(temp2, [2, 3]); //If this succeeds, reads are buffered
     }
 
     #[test]
     fn seek_plus_read_will_still_use_buffer() {
         let cut_inner = FakeStream::default();
         let mut cut = BufStream::with_capacity(cut_inner, 3);
-        cut.write(&[1,2,3,4,5,7,8,9,10]).unwrap();
+        cut.write(&[1, 2, 3, 4, 5, 7, 8, 9, 10]).unwrap();
 
         cut.seek(SeekFrom::Start(7)).unwrap();
         cut.buffer.data.clear();
-        cut.read(&mut [0,0,0]).unwrap();
+        cut.read(&mut [0, 0, 0]).unwrap();
         assert_eq!(cut.buffer.offset, 7);
 
         cut.seek(SeekFrom::Start(0)).unwrap();
         cut.inner.short_read_by = 1;
 
-        let mut buf = [0,0,0];
+        let mut buf = [0, 0, 0];
         let got = cut.read(&mut buf).unwrap();
         assert_eq!(got, 2); //Short read
-        assert_eq!(cut.buffer.data, [1,2]); //New read should have populated cache
+        assert_eq!(cut.buffer.data, [1, 2]); //New read should have populated cache
         assert_eq!(cut.buffer.offset, 0);
     }
 
-
     fn catch<R>(f: &mut dyn FnMut() -> std::io::Result<R>) -> std::io::Result<R> {
         let f = AssertUnwindSafe(f);
-        match panic::catch_unwind(|| {
-            f()
-        }) {
-            Ok(ok) => {
-                ok
-            }
-            Err(panic) => {
-                Result::Err(std::io::Error::new(ErrorKind::Other, format!("panic: {:?}", panic)))
-            }
+        match panic::catch_unwind(|| f()) {
+            Ok(ok) => ok,
+            Err(panic) => Result::Err(std::io::Error::new(
+                ErrorKind::Other,
+                format!("panic: {:?}", panic),
+            )),
         }
     }
 
     fn recreate_from(cut: &BufStream<FakeStream>) -> FakeStream {
         let mut temp = cut.inner.clone();
 
-        for (i,b) in cut.buffer.data.iter().enumerate() {
+        for (i, b) in cut.buffer.data.iter().enumerate() {
             let i = i + cut.buffer.offset;
             if temp.buf.len() <= i {
-                temp.buf.resize(i+1,0);
+                temp.buf.resize(i + 1, 0);
             }
             temp.buf[i] = *b;
         }
@@ -729,37 +723,38 @@ mod tests {
                     let seek_to = small_rng.gen_range(0..good.buf.len());
 
                     debug_println!("==SEEK to {}", seek_to);
-                    let re_good = catch(&mut ||good.seek(SeekFrom::Start(seek_to as u64)));
-                    let re_cut = catch(&mut ||cut.seek(SeekFrom::Start(seek_to as u64)));
+                    let re_good = catch(&mut || good.seek(SeekFrom::Start(seek_to as u64)));
+                    let re_cut = catch(&mut || cut.seek(SeekFrom::Start(seek_to as u64)));
 
                     good.repair();
                     cut.inner.repair();
                     match (re_good, re_cut) {
-                        (Ok(g),Ok(c)) => {
+                        (Ok(g), Ok(c)) => {
                             assert_eq!(c, g);
                         }
-                        (_, Ok(_)) |
-                        (Err(_), Err(_)) if panic_or_err => {
+                        (_, Ok(_)) | (Err(_), Err(_)) if panic_or_err => {
                             good.seek(SeekFrom::Start(cut.position as u64)).unwrap();
                         }
-                        (g,c) => {
-                            panic!("Unexpected results: {:?}, {:?} (panicking: {:?})", g, c, panic_or_err);
+                        (g, c) => {
+                            panic!(
+                                "Unexpected results: {:?}, {:?} (panicking: {:?})",
+                                g, c, panic_or_err
+                            );
                         }
                     }
-
                 }
-                1 => { //Read
+                1 => {
+                    //Read
                     let read_bytes = small_rng.gen_range(0..write_sizes);
                     let short_read = small_rng.gen_bool(0.3) as usize;
                     debug_println!("==READ {}", read_bytes);
                     let mut goodbuf = vec![0u8; read_bytes];
                     good.short_read_by = short_read;
-                    let good_got = catch(&mut ||good.read(&mut goodbuf));
-
+                    let good_got = catch(&mut || good.read(&mut goodbuf));
 
                     let mut cutbuf = vec![0u8; read_bytes];
                     cut.inner.short_read_by = short_read;
-                    let cut_got = catch(&mut ||cut.read(&mut cutbuf));
+                    let cut_got = catch(&mut || cut.read(&mut cutbuf));
 
                     debug_println!(
                         "did READ {:?}/{} -> {:?} (short-read: {})",
@@ -769,7 +764,7 @@ mod tests {
                         short_read
                     );
                     match (good_got, cut_got) {
-                        (Ok(good_got),Ok(cut_got)) => {
+                        (Ok(good_got), Ok(cut_got)) => {
                             if good_got > 0 {
                                 assert!(cut_got > 0);
                             }
@@ -783,33 +778,38 @@ mod tests {
                             }
                             assert_eq!(goodbuf[0..mingot], cutbuf[0..mingot]);
                         }
-                        (_, Ok(_)) |
-                        (Err(_), Err(_)) if panic_or_err => {
+                        (_, Ok(_)) | (Err(_), Err(_)) if panic_or_err => {
                             good.seek(SeekFrom::Start(cut.position as u64)).unwrap();
                         }
-                        (g,c) => {
-                            panic!("Unexpected read results: {:?}, {:?} (panicking: {:?})", g, c, panic_or_err);
+                        (g, c) => {
+                            panic!(
+                                "Unexpected read results: {:?}, {:?} (panicking: {:?})",
+                                g, c, panic_or_err
+                            );
                         }
                     }
                 }
-                0 | 2 => { // Write
+                0 | 2 => {
+                    // Write
                     let write_bytes = small_rng.gen_range(0..write_sizes);
                     let mut buf = vec![0u8; write_bytes];
                     small_rng.fill_bytes(&mut buf);
                     debug_println!("==WRITE {} {:?}", buf.len(), buf);
-                    let good_got = catch(&mut ||good.write(&buf));
-                    let cut_got = catch(&mut ||cut.write(&buf));
+                    let good_got = catch(&mut || good.write(&buf));
+                    let cut_got = catch(&mut || cut.write(&buf));
                     match (good_got, cut_got) {
                         (Ok(good_got), Ok(cut_got)) => {
                             assert_eq!(good_got, cut_got);
                             assert_eq!(good_got, write_bytes);
                         }
-                        (_, Ok(_)) |
-                        (Err(_), Err(_)) if panic_or_err => {
+                        (_, Ok(_)) | (Err(_), Err(_)) if panic_or_err => {
                             good = recreate_from(&cut);
                         }
-                        (g,c) => {
-                            panic!("Unexpected write results: {:?}, {:?} (panicking: {:?})", g, c, panic_or_err);
+                        (g, c) => {
+                            panic!(
+                                "Unexpected write results: {:?}, {:?} (panicking: {:?})",
+                                g, c, panic_or_err
+                            );
                         }
                     }
                 }
