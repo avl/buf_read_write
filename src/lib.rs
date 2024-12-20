@@ -1,14 +1,32 @@
 extern crate core;
 
-use std::collections::VecDeque;
+use std::cell::RefCell;
 use std::io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
+use std::ptr::read;
+
+
+
 
 #[derive(Clone, Debug)]
 struct MovingBuffer {
     offset: usize,
-    data: VecDeque<u8>,
+    data: Vec<u8>,
 }
+
+#[cfg(debug_assertions)]
+macro_rules! debug_println {
+    ($f:expr, $($a:expr),+) => {{
+        println!($f, $($a),+ );
+    }};
+}
+
+#[cfg(not(debug_assertions))]
+macro_rules! debug_println {
+    ($f:expr, $($a:expr),+) => {{
+    }};
+}
+
 
 fn overlap(range1: Range<usize>, range2: Range<usize>) -> Option<Range<usize>> {
     if range1.end <= range2.start {
@@ -24,23 +42,15 @@ impl MovingBuffer {
 
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            data: VecDeque::with_capacity(capacity),
+            data: Vec::with_capacity(capacity),
             offset: 0,
         }
     }
 
     fn flush(&mut self, flusher: &mut impl FnMut(usize, &[u8]) -> Result<(), std::io::Error>)  -> Result<(), std::io::Error> {
-        println!("Flushing {:?}", self);
-        let slices = self.data.as_slices();
-        dbg!(slices);
-        println!("Caller flusher 1");
-        flusher(self.offset, slices.0)?;
-        println!("Caller flusher 1b");
-        if !slices.1.is_empty() {
-            println!("Caller flusher 2");
-            flusher(self.offset+slices.0.len(), slices.1)?;
+        if !self.data.is_empty() {
+            flusher(self.offset, &self.data)?;
         }
-        println!("Dat aclear");
         self.data.clear();
         Ok(())
     }
@@ -50,54 +60,83 @@ impl MovingBuffer {
     fn write_at(&mut self, position: usize, data: &[u8], write_at: &mut impl FnMut(usize,  &[u8]) -> Result<(), std::io::Error>) -> Result<(), std::io::Error> {
         let free_capacity = self.data.capacity() - self.data.len();
 
-        dbg!(position, self.end(), free_capacity, data.len());
         if position == self.end() && free_capacity >= data.len() {
-            println!("Case 1 extend {:?} by {:?}", self.data, data);;
             self.data.extend(data);
             Ok(())
         } else if position >= self.offset && position + data.len() <= self.end() {
             let relative_offset = position - self.offset;
-            for (dst,src) in self.data.range_mut(relative_offset..relative_offset+data.len()).zip(data) {
-                *dst = *src;
-            }
-            println!("Case 2 slice overwrite {}..{} with {:?}", relative_offset, relative_offset+data.len(), data);
+            self.data[relative_offset..relative_offset+data.len()].copy_from_slice(data);
+
             Ok(())
         } else {
-            println!("Restart-case, current: {:?}", self);
             self.flush(write_at)?;
             self.data.clear();
             if data.len() < self.data.capacity() {
-                println!("Case 3 post flush new buf: {:?}", data);
                 self.offset = position;
                 self.data.extend(data);
                 Ok(())
             } else {
-                println!("Case 4 write-through: {:?} - {:?}", position, data);
                 write_at(position, data)?;
                 Ok(())
             }
         }
     }
 
-    fn read_at(&mut self, position: usize, buf: &mut [u8], read_at: &mut impl FnMut(usize,  &mut [u8]) -> std::io::Result<()> ) -> std::io::Result<()> {
+    fn read_at<F: FnMut(usize,  &mut [u8]) -> std::io::Result<usize>>(&mut self, position: usize, buf: &mut [u8],
+                                                                   read_at: &mut F,
+                                                                   write_at: &mut impl FnMut(usize,  &[u8]) -> Result<(), std::io::Error>,
+    ) -> std::io::Result<usize> {
+
+        if buf.len() > self.data.capacity() {
+            self.flush(write_at)?;
+            return read_at(position, buf);
+        }
+
+
+        fn inner_read_at<F: FnMut(usize,  &mut [u8]) -> std::io::Result<usize>>(position: usize, buf: &mut [u8], tself: &mut MovingBuffer, read_at: &mut F) -> std::io::Result<usize> {
+
+
+            read_at(position, buf)
+        }
+
         let read_range = position .. position+buf.len();
         let buffered_range = self.offset..self.end();
 
-        if read_range.start < buffered_range.start {
-            read_at(read_range.start, &mut buf[0..buffered_range.start - read_range.start])?;
+        let buflen = buf.len();
+
+        if read_range.end <= buffered_range.start {
+            return inner_read_at(read_range.start, buf, self, read_at);
+        }
+        if read_range.start >= buffered_range.end {
+            return inner_read_at(read_range.start, buf, self, read_at);
         }
 
-        if let Some(overlap) = overlap(read_range.clone(), buffered_range.clone()) {
-            let overlapping_src_slice = self.data.range((overlap.start-self.offset)..(overlap.end-self.offset));
-            for (dst,src) in buf[overlap.start-position..overlap.end-position].iter_mut().zip(overlapping_src_slice) {
-                *dst = *src;
+        let mut got =0;
+        if read_range.start < buffered_range.start {
+            if read_range.start + self.data.capacity() < buffered_range.start {
+                // Buffer size is too small to reach to the already existing stuff, and
+                // we don't split buffers.
+                unreachable!();
+            } else {
+                let len = (buffered_range.start - read_range.start).min(buflen);
+                got = read_at(read_range.start, &mut buf[0..len])?;
+                if got < len {
+                    return Ok(got);
+                }
             }
         }
 
-        if read_range.end > buffered_range.end {
-            read_at(buffered_range.end, &mut buf[0..read_range.end - buffered_range.end])?;
+        if let Some(overlap) = overlap(read_range.clone(), buffered_range.clone()) {
+            let overlapping_src_slice = &self.data[(overlap.start-self.offset)..(overlap.end-self.offset)];
+            buf[overlap.start-position..overlap.end-position].copy_from_slice(overlapping_src_slice);
+            got += overlapping_src_slice.len();
         }
-        Ok(())
+
+        if read_range.end > buffered_range.end {
+            let got2 = inner_read_at(buffered_range.end, &mut buf[buflen - (read_range.end - buffered_range.end)..], self, read_at)?;
+            got += got2;
+        }
+        Ok(got)
     }
 }
 
@@ -156,13 +195,10 @@ impl<T:Write+Seek> BufStream<T> {
     pub fn flush_write(&mut self) -> Result<(), std::io::Error> {
         self.poisoned = true;
         let t = self.buffer.flush(&mut |offset, data|{
-            println!("REAL WRITE writer at {} {:?} @ offset {}", offset, data, offset);
             if offset != self.inner.stream_position()? as usize {
-                println!("Inner seek {}", offset);
                 self.inner.seek(SeekFrom::Start(offset as u64))?;
             }
 
-            println!("Inner write {:?}", data);
             self.inner.write_all(data)?;
             Ok(())
         });
@@ -203,16 +239,34 @@ impl<T:Seek> Seek for BufStream<T> {
         Ok(self.position as u64)
     }
 }
-impl<T:Read+Seek> Read for BufStream<T> {
+impl<T:Read+Seek+Write> Read for BufStream<T> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.buffer.read_at(self.position, buf, &mut |pos,data|{
-            if self.position != pos {
-                self.inner.seek(SeekFrom::Start(pos as u64))?;
+        let mut inner = RefCell::new(&mut self.inner);
+        let got = self.buffer.read_at(self.position, buf, &mut |pos,data| {
+            let mut inner = inner.borrow_mut();
+            if inner.stream_position()? != pos as u64 {
+                inner.seek(SeekFrom::Start(pos as u64))?;
             }
-            self.inner.read(data)?;
+            println!("Reading from backing {} {}", pos, data.len());
+            let got = inner.read(data).unwrap();
+            println!("Read from backing {} {}", pos, data.len());
+            Ok(got)
+        },
+        &mut |offset,data|{
+            let mut inner = inner.borrow_mut();
+            if offset != inner.stream_position()? as usize {
+                inner.seek(SeekFrom::Start(offset as u64))?;
+            }
+
+            println!("Write back {} {}", offset, data.len());
+            inner.write_all(data).unwrap();
+            println!("Written back {} {}", offset, data.len());
             Ok(())
-        })?;
-        Ok(buf.len())
+        }
+
+        )?;
+        self.position += got;
+        Ok(got)
     }
 }
 
@@ -223,25 +277,29 @@ mod tests {
     use super::*;
 
     #[derive(Default, PartialEq, Eq, Debug, Clone)]
-    struct FakeWrite {
+    struct FakeStream {
         buf: Vec<u8>,
         position: usize,
+        short_read_by: usize,
     }
-    impl Read for FakeWrite {
+    impl Read for FakeStream {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let end = (self.position+buf.len()).min(self.buf.len());
-            let got = end-self.position;
+            let mut to_read = buf.len();
+            if to_read > 1 && self.short_read_by > 0 {
+                //to_read = (to_read-self.short_read_by).max(1);
+            }
+            let end = (self.position+buf.len()).min(to_read);
+            let got = end.saturating_sub(self.position);
+            if got == 0 {
+                return Ok(0)
+            }
             buf[0..got].copy_from_slice(&self.buf[self.position..self.position+got]);
             self.position += got;
             Ok(got)
         }
     }
-    impl Write for FakeWrite {
+    impl Write for FakeStream {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if buf[0] == 159 && self.position != 0{
-                println!("STop");
-            }
-            println!("ACtual fake write {:?} at {}", buf, self.position);
             for b in buf {
                 if self.position >= self.buf.len() {
                     assert!(self.position <= self.buf.len());
@@ -258,7 +316,7 @@ mod tests {
             Ok(())
         }
     }
-    impl Seek for FakeWrite {
+    impl Seek for FakeStream {
         fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
             match pos {
                 SeekFrom::Start(s) => {
@@ -277,51 +335,149 @@ mod tests {
 
     #[test]
     fn it_works() {
-        for i in 0..1000 {
-            fuzz(i);
+        for i in 0..10000000 {
+            fuzz(i, Some(3), Some(1));
+            fuzz(i, Some(1), Some(3));
+            fuzz(i, Some(10), Some(15));
+            fuzz(i, Some(15), Some(10));
+            fuzz(i, None, None);
         }
     }
     #[test]
-    fn regression25() {
+    fn regression() {
 
-        fuzz(25);
-
+        fuzz(3, Some(16), Some(10));
     }
-    fn fuzz(seed: u64) {
-        let mut good = FakeWrite::default();
-        let mut cut_inner = FakeWrite::default();
-        let mut cut = BufStream::with_capacity(cut_inner, 16);
+
+    fn run_exhaustive_conf(
+        bufsize: usize,
+        first_op: usize, first_op_param_options: usize,
+        second_op: usize, second_op_param_options: usize,
+        third_op: usize, third_op_param_options: usize,
+        mut databyte: u8,
+    ) {
+        let mut good = FakeStream::default();
+        let mut cut_inner = FakeStream::default();
+
+        let mut cut = BufStream::with_capacity(cut_inner, bufsize);
         use rand::SeedableRng;
-        let mut small_rng = rand::rngs::SmallRng::seed_from_u64(seed);
-        println!("Seed: {}", seed);
-        for _ in 0..2 {
-            match small_rng.gen_range(0..3) {
-                0 if good.buf.len() > 0=> {
-                    let seek_to = small_rng.gen_range(0..good.buf.len());
-                    println!("Seek to {}", seek_to);
+        for (op,param) in [
+            (first_op, first_op_param_options),
+            (second_op, second_op_param_options),
+            (third_op, third_op_param_options),
+        ] {
+            match op {
+                0 if good.buf.len() > 0 => {
+                    let seek_to = param;
+                    debug_println!("==SEEK to {}", seek_to);
                     good.seek(SeekFrom::Start(seek_to as u64)).unwrap();
                     cut.seek(SeekFrom::Start(seek_to as u64)).unwrap();
                 }
-                1  if good.buf.len() - good.position > 0 => {
-                    let read_bytes = small_rng.gen_range(0..(good.buf.len() - good.position) as usize);
-                    println!("Read {}", read_bytes);
+                1  => {
+                    let read_bytes = param;
+                    debug_println!("==READ {}",read_bytes);
                     let mut goodbuf = vec![0u8; read_bytes];
                     good.read(&mut goodbuf).unwrap();
 
                     let mut cutbuf = vec![0u8; read_bytes];
                     cut.read(&mut cutbuf).unwrap();
+                    assert_eq!(goodbuf, cutbuf);
+                    debug_println!("did READ {} -> {:?}", read_bytes, cutbuf);
                 }
                 0|1|2 => {
-                    let write_bytes = small_rng.gen_range(0..10);
+                    let write_bytes = param;
                     let mut buf = vec![0u8; write_bytes];
-                    small_rng.fill_bytes(&mut buf);
-                    println!("WRITE {:?}\nStates cut: {:?}, states good: {:?}", buf, cut, good);
+                    for i in 0..write_bytes {
+                        buf[i] = databyte;
+                        databyte = databyte.wrapping_add(17);
+                    }
+                    debug_println!("==WRITE {} {:?}", buf.len(), buf);
                     good.write(&buf).unwrap();
                     cut.write(&buf).unwrap();
                 }
                 _ => unreachable!()
             }
-            println!("Cut state: {:?}", cut);
+        }
+        let mut cut_cloned = cut.clone();
+        cut_cloned.flush().unwrap();
+        assert_eq!(&good.buf, &cut_cloned.inner.buf);
+        assert_eq!(&good.position, &cut_cloned.position);
+
+    }
+
+    #[test]
+    fn exhaustive() {
+        let mut databyte = 0;
+        for bufsize in [1,3,7] {
+            for first_op in 0..3 {
+                let first_op_param_options = if first_op != 0 {4} else {1};
+                for first_op_param in 0..first_op_param_options {
+                    for second_op in 0..3 {
+                        let second_op_param_options = if first_op != 0 {4} else {1};
+                        for third_op in 0..3 {
+                            let third_op_param_options = if first_op != 0 { 4 } else { 1 };
+
+                            println!("Iteration {} {} {} {} {} {} {} {}",
+                                     bufsize,
+                                     first_op, first_op_param_options,
+                                     second_op, second_op_param_options,
+                                     third_op, third_op_param_options,
+                                     databyte
+                            );
+                            run_exhaustive_conf(
+                                bufsize,
+                                first_op, first_op_param_options,
+                                second_op, second_op_param_options,
+                                third_op, third_op_param_options,
+                                databyte
+                            );
+                            databyte += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn fuzz(seed: u64, buffer_size: Option<usize>, write_sizes: Option<usize>) {
+        let mut small_rng = rand::rngs::SmallRng::seed_from_u64(seed);
+        let buffer_size = buffer_size.unwrap_or(small_rng.gen_range(1..10));
+        let write_sizes = write_sizes.unwrap_or(small_rng.gen_range(1..10));
+        let mut good = FakeStream::default();
+        let mut cut_inner = FakeStream::default();
+        let mut cut = BufStream::with_capacity(cut_inner, buffer_size);
+        use rand::SeedableRng;
+        debug_println!("Seed: {}, buffer: {}, write size: {}", seed, buffer_size, write_sizes);
+        for _ in 0..7 {
+            match small_rng.gen_range(0..3) {
+                0 if good.buf.len() > 0=> {
+                    let seek_to = small_rng.gen_range(0..good.buf.len());
+                    debug_println!("==SEEK to {}", seek_to);
+                    good.seek(SeekFrom::Start(seek_to as u64)).unwrap();
+                    cut.seek(SeekFrom::Start(seek_to as u64)).unwrap();
+                }
+                1  => {
+                    let read_bytes = small_rng.gen_range(0..write_sizes);
+                    debug_println!("==READ {}",read_bytes);
+                    let mut goodbuf = vec![0u8; read_bytes];
+                    good.read(&mut goodbuf).unwrap();
+
+                    let mut cutbuf = vec![0u8; read_bytes];
+                    cut.read(&mut cutbuf).unwrap();
+                    assert_eq!(goodbuf, cutbuf);
+                    debug_println!("did READ {} -> {:?}", read_bytes, cutbuf);
+                }
+                0|1|2 => {
+                    let write_bytes = small_rng.gen_range(0..write_sizes);
+                    let mut buf = vec![0u8; write_bytes];
+                    small_rng.fill_bytes(&mut buf);
+                    debug_println!("==WRITE {} {:?}", buf.len(), buf);
+                    good.write(&buf).unwrap();
+                    cut.write(&buf).unwrap();
+                }
+                _ => unreachable!()
+            }
+            debug_println!("Cut state: {:?}", cut);
             let mut cut_cloned = cut.clone();
             cut_cloned.flush().unwrap();
             assert_eq!(&good.buf, &cut_cloned.inner.buf);
