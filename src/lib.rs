@@ -85,7 +85,8 @@ struct MovingBuffer {
 #[cfg(debug_assertions)]
 macro_rules! debug_println {
     ($f:expr, $($a:expr),+) => {{
-        println!($f, $($a),+ );
+        // Enable this if you need to debug
+        //println!($f, $($a),+ );
     }};
 }
 

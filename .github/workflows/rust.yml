@@ -20,13 +20,13 @@ jobs:
     - name: Install nightly
       run: rustup toolchain install nightly && rustup toolchain install stable && rustup toolchain install 1.74
     - name: Build (nightly)
-      run: cargo +nightly build --workspace 
+      run: cargo +nightly build --release
     - name: Run tests (nightly)
-      run: cargo +nightly test --workspace 
+      run: cargo +nightly test --release
     - name: Build (stable)
-      run: cargo +stable build --workspace 
+      run: cargo +stable build --release
     - name: Run tests (stable)
-      run: cargo +stable test --workspace 
+      run: cargo +stable test --release
     - name: Build (1.70)
-      run: cargo +1.70 build --workspace
+      run: cargo +1.70 build --release
 
