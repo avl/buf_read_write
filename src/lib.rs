@@ -789,9 +789,8 @@ mod tests {
         let mut cut = BufStream::with_capacity(cut_inner, 100);
         cut.write(&[1]).unwrap();
         cut.inner_position = u64::MAX;
-        cut.flush().unwrap();
-        cut.write(&[2]).unwrap();
-        cut.flush().unwrap();
+        let pos = obtain_stream_position(&mut cut.inner, &mut cut.inner_position).unwrap();
+        assert_eq!(pos, cut.inner.stream_position().unwrap());
     }
 
     #[test]
