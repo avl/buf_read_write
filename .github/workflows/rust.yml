@@ -1,0 +1,32 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  schedule:
+    - cron: "37 8 * * 1,5"
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install nightly
+      run: rustup toolchain install nightly && rustup toolchain install stable && rustup toolchain install 1.74
+    - name: Build (nightly)
+      run: cargo +nightly build --workspace 
+    - name: Run tests (nightly)
+      run: cargo +nightly test --workspace 
+    - name: Build (stable)
+      run: cargo +stable build --workspace 
+    - name: Run tests (stable)
+      run: cargo +stable test --workspace 
+    - name: Build (1.70)
+      run: cargo +1.70 build --workspace
+
