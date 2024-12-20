@@ -43,6 +43,14 @@
 //!   and is often what you want for disk io (the main use case for this library). Even
 //!   [`std::io::BufWriter`] will effectively do this when it is flushing its IO buffer.
 //!
+//! * Seeks are not immediately passed on to the backing implementation. Instead, before
+//!   each read, a seek is issued if required. This makes sense, since when the buffer needs
+//!   to be flushed, extra seeks might otherwise be needed.
+//!
+//! * This crate does not attempt to support files larger than 2^64 bytes. Seeking this far
+//!   is impossible because of type ranges, but this crate makes no attempt at allowing even
+//!   writes to proceed beyond this limitation.
+//!
 //! # Implementation
 //!
 //! * This crate contains extensive test-routines.
@@ -54,13 +62,13 @@
 extern crate core;
 
 use std::cell::RefCell;
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::mem::forget;
 use std::ops::Range;
 
 #[derive(Clone, Debug)]
 struct MovingBuffer {
-    offset: usize,
+    offset: u64,
     data: Vec<u8>,
 }
 
@@ -78,7 +86,7 @@ macro_rules! debug_println {
     ($f:expr, $($a:expr),+) => {{}};
 }
 
-fn overlap(range1: Range<usize>, range2: Range<usize>) -> Option<Range<usize>> {
+fn overlap(range1: Range<u64>, range2: Range<u64>) -> Option<Range<u64>> {
     if range1.end <= range2.start {
         return None;
     }
@@ -87,6 +95,39 @@ fn overlap(range1: Range<usize>, range2: Range<usize>) -> Option<Range<usize>> {
     }
     Some(range1.start.max(range2.start)..range1.end.min(range2.end))
 }
+
+fn checked_add(position: u64, size: usize) -> std::io::Result<u64> {
+    position.checked_add(size.try_into()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))?)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))
+}
+fn checked_add_usize(position: usize, size:usize) -> std::io::Result<usize> {
+    position.checked_add(size)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))
+}
+fn checked_sub_u64(position: u64, size:u64) -> std::io::Result<u64> {
+    position.checked_sub(size)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic underflow"))
+}
+
+#[inline]
+fn to_usize(value: u64) -> std::io::Result<usize> {
+    value.try_into()
+        .map_err(|_err| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))
+}
+#[inline]
+fn to_u64(value: usize) -> std::io::Result<u64> {
+    value.try_into()
+        .map_err(|_err| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))
+}
+
+struct DropGuard<'a>(&'a mut Vec<u8>);
+impl Drop for DropGuard<'_> {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
 
 impl MovingBuffer {
     fn with_capacity(capacity: usize) -> Self {
@@ -98,7 +139,7 @@ impl MovingBuffer {
 
     fn flush(
         &mut self,
-        flusher: &mut impl FnMut(usize, &[u8]) -> Result<(), std::io::Error>,
+        flusher: &mut impl FnMut(u64, &[u8]) -> Result<(), std::io::Error>,
     ) -> Result<(), std::io::Error> {
         if !self.data.is_empty() {
             flusher(self.offset, &self.data)?;
@@ -106,23 +147,25 @@ impl MovingBuffer {
         self.data.clear();
         Ok(())
     }
-    fn end(&self) -> usize {
-        self.offset + self.data.len()
+    #[inline]
+    fn end(&self) -> Result<u64, std::io::Error> {
+        checked_add(self.offset, self.data.len())
     }
     fn write_at(
         &mut self,
-        position: usize,
+        position: u64,
         data: &[u8],
-        write_at: &mut impl FnMut(usize, &[u8]) -> Result<(), std::io::Error>,
+        write_at: &mut impl FnMut(u64, &[u8]) -> Result<(), std::io::Error>,
     ) -> Result<(), std::io::Error> {
+        // The following cannot overflow, because of how Vec works.
         let free_capacity = self.data.capacity() - self.data.len();
 
-        if position == self.end() && free_capacity >= data.len() {
+        if position == self.end()? && free_capacity >= data.len() {
             self.data.extend(data);
             Ok(())
-        } else if position >= self.offset && position + data.len() <= self.end() {
-            let relative_offset = position - self.offset;
-            self.data[relative_offset..relative_offset + data.len()].copy_from_slice(data);
+        } else if position >= self.offset && checked_add(position, data.len())? <= self.end()? {
+            let relative_offset = to_usize(checked_sub_u64(position, self.offset)?)?;
+            self.data[relative_offset..checked_add_usize(relative_offset,data.len())?].copy_from_slice(data);
 
             Ok(())
         } else {
@@ -140,11 +183,11 @@ impl MovingBuffer {
     }
 
     fn read_at<
-        R: FnMut(usize, &mut [u8]) -> std::io::Result<usize>,
-        W: FnMut(usize, &[u8]) -> std::io::Result<()>,
+        R: FnMut(u64, &mut [u8]) -> std::io::Result<usize>,
+        W: FnMut(u64, &[u8]) -> std::io::Result<()>,
     >(
         &mut self,
-        position: usize,
+        position: u64,
         buf: &mut [u8],
         read_at: &mut R,
         write_at: &mut W,
@@ -153,12 +196,13 @@ impl MovingBuffer {
             self.flush(write_at)?;
             return read_at(position, buf);
         }
+        _ = checked_add(position, buf.len())?;
 
         fn inner_read_at<
-            F: FnMut(usize, &mut [u8]) -> std::io::Result<usize>,
-            W: FnMut(usize, &[u8]) -> std::io::Result<()>,
+            F: FnMut(u64, &mut [u8]) -> std::io::Result<usize>,
+            W: FnMut(u64, &[u8]) -> std::io::Result<()>,
         >(
-            position: usize,
+            position: u64,
             buf: &mut [u8],
             tself: &mut MovingBuffer,
             read_at: &mut F,
@@ -167,27 +211,23 @@ impl MovingBuffer {
             if buf.is_empty() {
                 return Ok(0);
             }
+
             tself.flush(write_at)?;
             let cap = tself.data.capacity();
+            _ = checked_add(position, cap)?;
             tself.data.resize(cap, 0);
             tself.offset = position;
-            struct DropGuard<'a>(&'a mut Vec<u8>);
-            impl Drop for DropGuard<'_> {
-                fn drop(&mut self) {
-                    self.0.clear();
-                }
-            }
             let mut dropguard = DropGuard(&mut tself.data);
             let got = read_at(position, &mut dropguard.0)?;
+            dropguard.0.truncate(got);
             forget(dropguard);
-            tself.data.truncate(got);
             let curgot = got.min(buf.len());
             buf[..curgot].copy_from_slice(&tself.data[0..curgot]);
             Ok(curgot)
         }
 
-        let read_range = position..position + buf.len();
-        let buffered_range = self.offset..self.end();
+        let read_range = position..checked_add(position, buf.len())?;
+        let buffered_range = self.offset..self.end()?;
 
         let buflen = buf.len();
 
@@ -200,7 +240,7 @@ impl MovingBuffer {
 
         let mut got = 0;
         if read_range.start < buffered_range.start {
-            let len = (buffered_range.start - read_range.start).min(buflen);
+            let len = to_usize(buffered_range.start - read_range.start)?.min(buflen);
             got = read_at(read_range.start, &mut buf[0..len])?;
             if got < len {
                 return Ok(got);
@@ -209,32 +249,33 @@ impl MovingBuffer {
 
         if let Some(overlap) = overlap(read_range.clone(), buffered_range.clone()) {
             let overlapping_src_slice =
-                &self.data[(overlap.start - self.offset)..(overlap.end - self.offset)];
-            buf[overlap.start - position..overlap.end - position]
+                &self.data[to_usize(overlap.start - self.offset)?..to_usize(overlap.end - self.offset)?];
+            buf[to_usize(overlap.start - position)?..to_usize(overlap.end - position)?]
                 .copy_from_slice(overlapping_src_slice);
-            got += overlapping_src_slice.len();
+            got = checked_add_usize(got, overlapping_src_slice.len())?;
         }
 
         if read_range.end > buffered_range.end {
             let got2 = inner_read_at(
                 buffered_range.end,
-                &mut buf[buflen - (read_range.end - buffered_range.end)..],
+                &mut buf[buflen - to_usize(read_range.end - buffered_range.end)?..],
                 self,
                 read_at,
                 write_at,
             )?;
-            got += got2;
+            got = checked_add_usize(got, got2)?;
         }
         Ok(got)
     }
 }
 
 /// Buffering reader/writer
-/// See crate documentation.
+///
+/// See crate documentation for more details!
 #[derive(Debug)]
 pub struct BufStream<T> {
     buffer: MovingBuffer,
-    position: usize,
+    position: u64,
     inner: T,
 }
 
@@ -254,6 +295,43 @@ impl<T> BufStream<T> {
 
 const DEFAULT_BUF_SIZE: usize = 8192;
 
+
+impl<T:Read+Write+Seek+std::fmt::Debug> BufRead for BufStream<T> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        let buf_end = checked_add(self.buffer.offset, self.buffer.data.len())?;
+        if self.position >= self.buffer.offset && self.position < buf_end {
+            let usable = to_usize(buf_end - self.position)?;
+            debug_assert!(usable > 0);
+            let buf_offset = to_usize(self.position - self.buffer.offset)?;
+            return Ok(&self.buffer.data[buf_offset..buf_offset + usable]);
+        }
+        println!("fillbuf, pre fluish: {:?}", self);
+        self.flush_write()?;
+        println!("fillbuf, post fluish: {:?}", self);
+        let cap = self.buffer.data.capacity();
+        self.buffer.data.resize(cap, 0);
+        self.buffer.offset = self.position;
+        debug_assert!(self.buffer.data.len() > 0);
+        let mut dropguard = DropGuard(&mut self.buffer.data);
+
+        if self.inner.stream_position()? != self.position {
+            self.inner.seek(SeekFrom::Start(self.position))?;
+        }
+
+        let got = self.inner.read(&mut dropguard.0)?;
+        dropguard.0.truncate(got);
+        forget(dropguard);
+        dbg!(got);
+        println!("fillbuf, pre ret: {:?}", self);
+        Ok(&self.buffer.data)
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.position = checked_add(self.position, amt)
+            .expect("u64::MAX offset cannot be exceeded");
+    }
+}
+
 impl<T: Write + Seek> Write for BufStream<T> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.buffer.write_at(self.position, buf, &mut |pos, data| {
@@ -266,7 +344,8 @@ impl<T: Write + Seek> Write for BufStream<T> {
             Ok(())
         })?;
 
-        self.position += buf.len();
+        self.position = self.position.checked_add(to_u64(buf.len())?)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))?;
 
         Ok(buf.len())
     }
@@ -280,7 +359,7 @@ impl<T: Write + Seek> Write for BufStream<T> {
 impl<T: Write + Seek> BufStream<T> {
     fn flush_write(&mut self) -> Result<(), std::io::Error> {
         let t = self.buffer.flush(&mut |offset, data| {
-            if offset != self.inner.stream_position()? as usize {
+            if offset != self.inner.stream_position()? {
                 self.inner.seek(SeekFrom::Start(offset as u64))?;
             }
 
@@ -310,22 +389,18 @@ impl<T: Seek> Seek for BufStream<T> {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         match pos {
             SeekFrom::Start(pos) => {
-                self.position = pos as usize;
+                self.position = pos;
             }
             SeekFrom::End(e) => {
-                self.inner.seek(SeekFrom::End(e))?;
-                self.position = self.inner.stream_position()? as usize;
+                let buf_end = checked_add(self.buffer.offset, self.buffer.data.len())?;
+
+                self.position = (self.inner.stream_position()?).max(buf_end)
+                    .checked_add_signed(e)
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Seek index out of range"))?;
             }
             SeekFrom::Current(delta) => {
-                self.inner.seek(SeekFrom::Start(
-                    (self.position as u64)
-                        .checked_add_signed(delta)
-                        .ok_or::<std::io::Error>(std::io::Error::new(
-                            ErrorKind::Other,
-                            "overflow",
-                        ))?,
-                ))?;
-                self.position = self.inner.stream_position()? as usize;
+                self.position = self.position.checked_add_signed(delta )
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Seek index out of range"))?;
             }
         }
         Ok(self.position as u64)
@@ -348,7 +423,7 @@ impl<T: Read + Seek + Write> Read for BufStream<T> {
             },
             &mut |offset, data| {
                 let mut inner = inner.borrow_mut();
-                if offset != inner.stream_position()? as usize {
+                if offset != inner.stream_position()? {
                     inner.seek(SeekFrom::Start(offset as u64))?;
                 }
 
@@ -357,13 +432,14 @@ impl<T: Read + Seek + Write> Read for BufStream<T> {
             },
         )?;
         debug_assert!(got <= buf.len());
-        self.position += got;
+        self.position = checked_add(self.position,got)?;
         Ok(got)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::ErrorKind;
     use super::*;
     use rand::{Rng, RngCore};
     use std::panic;
@@ -403,6 +479,7 @@ mod tests {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             self.maybe_panic()?;
 
+            println!("Fakestream read {}: {:?}", buf.len(), self);
             let mut to_read = buf.len();
 
             if to_read > 1 && self.short_read_by > 0 {
@@ -498,7 +575,7 @@ mod tests {
                     assert_eq!(&goodbuf[..gotmin], &cutbuf[..gotmin]);
                     debug_println!("did READ {} -> {:?}", read_bytes, cutbuf);
                     if cutgot != goodgot {
-                        good.position = cut.position;
+                        good.position = cut.position as usize;
                     }
                 }
                 0 | 2 => {
@@ -522,7 +599,7 @@ mod tests {
         cut.flush().unwrap();
         assert_eq!(cut.buffer.data.capacity(), bufsize);
         assert_eq!(&good.buf, &cut.inner.buf);
-        assert_eq!(&good.position, &cut.position);
+        assert_eq!(&good.position, &(cut.position as usize));
     }
 
     #[test]
@@ -594,17 +671,17 @@ mod tests {
     #[test]
     fn fuzz_many() {
         for i in 0..1000000 {
-            fuzz(i, Some(3), Some(1));
-            fuzz(i, Some(1), Some(3));
-            fuzz(i, Some(10), Some(15));
-            fuzz(i, Some(15), Some(10));
-            fuzz(i, None, None);
+            fuzz(i, Some(3), Some(1), false);
+            fuzz(i, Some(1), Some(3), false);
+            fuzz(i, Some(10), Some(15), false);
+            fuzz(i, Some(15), Some(10), false);
+            fuzz(i, None, None, true);
         }
     }
 
     #[test]
     fn regression() {
-        fuzz(0, Some(15), Some(10));
+        fuzz(0, Some(15), Some(10), false);
     }
 
     #[test]
@@ -683,17 +760,17 @@ mod tests {
         let mut temp = cut.inner.clone();
 
         for (i, b) in cut.buffer.data.iter().enumerate() {
-            let i = i + cut.buffer.offset;
+            let i = i + cut.buffer.offset as usize;
             if temp.buf.len() <= i {
                 temp.buf.resize(i + 1, 0);
             }
             temp.buf[i] = *b;
         }
-        temp.position = cut.position;
+        temp.position = cut.position as usize;
         temp
     }
 
-    fn fuzz(seed: u64, buffer_size: Option<usize>, write_sizes: Option<usize>) {
+    fn fuzz(seed: u64, buffer_size: Option<usize>, write_sizes: Option<usize>, bufread: bool) {
         let mut small_rng = rand::rngs::SmallRng::seed_from_u64(seed);
         let buffer_size = buffer_size.unwrap_or(small_rng.gen_range(1..10));
         let write_sizes = write_sizes.unwrap_or(small_rng.gen_range(1..10));
@@ -754,7 +831,24 @@ mod tests {
 
                     let mut cutbuf = vec![0u8; read_bytes];
                     cut.inner.short_read_by = short_read;
-                    let cut_got = catch(&mut || cut.read(&mut cutbuf));
+
+                    let cut_got;
+                    if bufread {
+                        cut_got = catch(&mut || {
+                            let cutbuflen = cutbuf.len();
+                            dbg!(&cut);
+                            dbg!(cutbuflen);
+                            let fillbuf = cut.fill_buf()?;
+                            let data = &fillbuf[0..cutbuflen.min(fillbuf.len())];
+                            cutbuf[0..data.len()].copy_from_slice(data);
+                            let len = data.len();
+                            cut.consume(len);
+                            Ok(len)
+                        });
+
+                    } else {
+                        cut_got = catch(&mut || cut.read(&mut cutbuf));
+                    }
 
                     debug_println!(
                         "did READ {:?}/{} -> {:?} (short-read: {})",
@@ -768,13 +862,13 @@ mod tests {
                             if good_got > 0 {
                                 assert!(cut_got > 0);
                             }
-                            if short_read == 0 && good.position + read_bytes <= good.buf.len() {
+                            if short_read == 0 && good.position + read_bytes <= good.buf.len() && !bufread {
                                 assert_eq!(cut_got, good_got);
                                 assert_eq!(cut_got, read_bytes);
                             }
                             let mingot = cut_got.min(good_got);
                             if cut_got != good_got {
-                                good.position = cut.position;
+                                good.position = cut.position as usize;
                             }
                             assert_eq!(goodbuf[0..mingot], cutbuf[0..mingot]);
                         }
@@ -822,7 +916,7 @@ mod tests {
             let mut cut_cloned = cut.clone();
             cut_cloned.flush().unwrap();
             assert_eq!(&good.buf, &cut_cloned.inner.buf);
-            assert_eq!(&good.position, &cut_cloned.position);
+            assert_eq!(&good.position, &(cut_cloned.position as usize));
         }
     }
 }
