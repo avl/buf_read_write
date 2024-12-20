@@ -176,7 +176,10 @@ impl MovingBuffer {
         flusher: &mut impl FnMut(u64, &[u8]) -> Result<(), std::io::Error>,
     ) -> Result<(), std::io::Error> {
         if !self.data.is_empty() {
-            flusher(self.offset+self.dirty.start as u64, &self.data[self.dirty.clone()])?;
+            flusher(
+                self.offset + self.dirty.start as u64,
+                &self.data[self.dirty.clone()],
+            )?;
         }
         self.dirty = 0..0;
         self.data.clear();
@@ -196,14 +199,16 @@ impl MovingBuffer {
         // The following cannot overflow, because of how Vec works.
         let free_capacity = self.data.capacity() - self.data.len();
         if position == self.end()? && free_capacity >= data.len() {
-            union(&mut self.dirty, self.data.len()..self.data.len()+data.len());
+            union(
+                &mut self.dirty,
+                self.data.len()..self.data.len() + data.len(),
+            );
             self.data.extend(data);
             Ok(())
         } else if position >= self.offset && checked_add(position, data.len())? <= self.end()? {
             let relative_offset = to_usize(checked_sub_u64(position, self.offset)?)?;
             let end = checked_add_usize(relative_offset, data.len())?;
-            self.data[relative_offset..end]
-                .copy_from_slice(data);
+            self.data[relative_offset..end].copy_from_slice(data);
             union(&mut self.dirty, relative_offset..end);
             Ok(())
         } else {
@@ -211,7 +216,10 @@ impl MovingBuffer {
             self.data.clear();
             if data.len() < self.data.capacity() {
                 self.offset = position;
-                union(&mut self.dirty, self.data.len()..self.data.len()+data.len());
+                union(
+                    &mut self.dirty,
+                    self.data.len()..self.data.len() + data.len(),
+                );
                 self.data.extend(data);
                 Ok(())
             } else {
@@ -259,8 +267,8 @@ impl MovingBuffer {
             tself.data.resize(cap, 0);
             tself.offset = position;
 
-            let mut dropguard = DropGuard(&mut tself.data);
-            let got = read_at(position, &mut dropguard.0)?;
+            let dropguard = DropGuard(&mut tself.data);
+            let got = read_at(position, dropguard.0)?;
             dropguard.0.truncate(got);
             forget(dropguard);
             let curgot = got.min(buf.len());
@@ -363,8 +371,8 @@ impl<T: Read + Write + Seek + std::fmt::Debug> BufRead for BufStream<T> {
         let cap = self.buffer.data.capacity();
         self.buffer.data.resize(cap, 0);
         self.buffer.offset = self.position;
-        debug_assert!(self.buffer.data.len() > 0);
-        let mut dropguard = DropGuard(&mut self.buffer.data);
+        debug_assert!(!self.buffer.data.is_empty());
+        let dropguard = DropGuard(&mut self.buffer.data);
 
         if obtain_stream_position(&mut self.inner, &mut self.inner_position)? != self.position {
             self.inner_position = u64::MAX;
@@ -372,7 +380,7 @@ impl<T: Read + Write + Seek + std::fmt::Debug> BufRead for BufStream<T> {
         }
         self.inner_position = u64::MAX;
 
-        let got = self.inner.read(&mut dropguard.0)?;
+        let got = self.inner.read(dropguard.0)?;
         dropguard.0.truncate(got);
         self.inner_position = checked_add(self.position, got)?;
         forget(dropguard);
@@ -390,9 +398,9 @@ impl<T: Write + Seek> BufStream<T> {
     #[inline(never)]
     fn write_cold(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.buffer.write_at(self.position, buf, &mut |pos, data| {
-            if obtain_stream_position(&mut self.inner, &mut self.inner_position)? != pos as u64 {
+            if obtain_stream_position(&mut self.inner, &mut self.inner_position)? != pos {
                 self.inner_position = u64::MAX;
-                let t = self.inner.seek(SeekFrom::Start(pos as u64));
+                let t = self.inner.seek(SeekFrom::Start(pos));
                 t?;
             }
             self.inner_position = u64::MAX;
@@ -417,7 +425,8 @@ impl<T: Write + Seek> Write for BufStream<T> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let free_capacity = self.buffer.data.capacity() - self.buffer.data.len();
         if self.position == self.buffer.offset + self.buffer.data.len() as u64
-            && free_capacity >= buf.len() && self.buffer.dirty.end == self.buffer.data.len()
+            && free_capacity >= buf.len()
+            && self.buffer.dirty.end == self.buffer.data.len()
         {
             self.buffer.data.extend(buf);
             self.buffer.dirty.end += buf.len();
@@ -438,7 +447,7 @@ impl<T: Write + Seek> BufStream<T> {
         let t = self.buffer.flush(&mut |offset, data| {
             if offset != obtain_stream_position(&mut self.inner, &mut self.inner_position)? {
                 self.inner_position = u64::MAX;
-                self.inner.seek(SeekFrom::Start(offset as u64))?;
+                self.inner.seek(SeekFrom::Start(offset))?;
             }
             self.inner_position = u64::MAX;
 
@@ -452,7 +461,6 @@ impl<T: Write + Seek> BufStream<T> {
 }
 
 impl<T> BufStream<T> {
-
     /// Crate a new instance, wrapping `inner`, with the given buffer size.
     ///
     /// Note:
@@ -501,7 +509,7 @@ impl<T: Write + Seek> Seek for BufStream<T> {
                 })?;
             }
         }
-        Ok(self.position as u64)
+        Ok(self.position)
     }
 }
 impl<T: Read + Seek + Write> BufStream<T> {
@@ -518,7 +526,7 @@ impl<T: Read + Seek + Write> BufStream<T> {
 
                 let mut inner_position = inner_position.borrow_mut();
 
-                if obtain_stream_position(&mut *inner, &mut *inner_position)? != pos {
+                if obtain_stream_position(&mut *inner, *inner_position)? != pos {
                     **inner_position = u64::MAX;
                     inner.seek(SeekFrom::Start(pos))?;
                 }
@@ -531,7 +539,7 @@ impl<T: Read + Seek + Write> BufStream<T> {
             &mut |offset, data| {
                 let mut inner_position = inner_position.borrow_mut();
                 let mut inner = inner.borrow_mut();
-                if offset != obtain_stream_position(&mut *inner, &mut *inner_position)? {
+                if offset != obtain_stream_position(&mut *inner, *inner_position)? {
                     **inner_position = u64::MAX;
                     inner.seek(SeekFrom::Start(offset))?;
                 }

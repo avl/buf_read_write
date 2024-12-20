@@ -27,7 +27,7 @@ fn many_small_reads_bufstream() -> BufStream<Cursor<Vec<u8>>> {
     let mut bufstream = BufStream::new(Cursor::new(v));
 
     for _i in 0..100 {
-        bufstream.read(&mut [0,1,2,3]).unwrap();
+        bufstream.read(&mut [0, 1, 2, 3]).unwrap();
     }
     bufstream
 }
@@ -37,7 +37,7 @@ fn many_small_reads_bufreader() -> BufReader<Cursor<Vec<u8>>> {
     let mut bufstream = BufReader::new(Cursor::new(v));
 
     for _i in 0..100 {
-        bufstream.read(&mut [0,1,2,3]).unwrap();
+        bufstream.read(&mut [0, 1, 2, 3]).unwrap();
     }
     bufstream
 }
