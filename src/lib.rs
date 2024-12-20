@@ -73,9 +73,7 @@ use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::mem::forget;
 use std::ops::Range;
 
-
 const DEFAULT_BUF_SIZE: usize = 8192;
-
 
 #[derive(Clone, Debug)]
 struct MovingBuffer {
@@ -109,29 +107,35 @@ fn overlap(range1: Range<u64>, range2: Range<u64>) -> Option<Range<u64>> {
 
 #[inline(always)]
 fn checked_add(position: u64, size: usize) -> std::io::Result<u64> {
-    position.checked_add(size.try_into()
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))?)
+    position
+        .checked_add(size.try_into().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow")
+        })?)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))
 }
 #[inline(always)]
-fn checked_add_usize(position: usize, size:usize) -> std::io::Result<usize> {
-    position.checked_add(size)
+fn checked_add_usize(position: usize, size: usize) -> std::io::Result<usize> {
+    position
+        .checked_add(size)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))
 }
 #[inline(always)]
-fn checked_sub_u64(position: u64, size:u64) -> std::io::Result<u64> {
-    position.checked_sub(size)
+fn checked_sub_u64(position: u64, size: u64) -> std::io::Result<u64> {
+    position
+        .checked_sub(size)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic underflow"))
 }
 
 #[inline]
 fn to_usize(value: u64) -> std::io::Result<usize> {
-    value.try_into()
+    value
+        .try_into()
         .map_err(|_err| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))
 }
 #[inline]
 fn to_u64(value: usize) -> std::io::Result<u64> {
-    value.try_into()
+    value
+        .try_into()
         .map_err(|_err| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))
 }
 
@@ -141,7 +145,6 @@ impl Drop for DropGuard<'_> {
         self.0.clear();
     }
 }
-
 
 impl MovingBuffer {
     fn with_capacity(capacity: usize) -> Self {
@@ -181,7 +184,8 @@ impl MovingBuffer {
             Ok(())
         } else if position >= self.offset && checked_add(position, data.len())? <= self.end()? {
             let relative_offset = to_usize(checked_sub_u64(position, self.offset)?)?;
-            self.data[relative_offset..checked_add_usize(relative_offset,data.len())?].copy_from_slice(data);
+            self.data[relative_offset..checked_add_usize(relative_offset, data.len())?]
+                .copy_from_slice(data);
 
             Ok(())
         } else {
@@ -267,8 +271,8 @@ impl MovingBuffer {
         }
 
         if let Some(overlap) = overlap(read_range.clone(), buffered_range.clone()) {
-            let overlapping_src_slice =
-                &self.data[to_usize(overlap.start - self.offset)?..to_usize(overlap.end - self.offset)?];
+            let overlapping_src_slice = &self.data
+                [to_usize(overlap.start - self.offset)?..to_usize(overlap.end - self.offset)?];
             buf[to_usize(overlap.start - position)?..to_usize(overlap.end - position)?]
                 .copy_from_slice(overlapping_src_slice);
             got = checked_add_usize(got, overlapping_src_slice.len())?;
@@ -314,9 +318,11 @@ impl<T> BufStream<T> {
     }
 }
 
-
 #[inline]
-fn obtain_stream_position<T:Seek>(inner: &mut T, inner_position: &mut u64) -> std::io::Result<u64> {
+fn obtain_stream_position<T: Seek>(
+    inner: &mut T,
+    inner_position: &mut u64,
+) -> std::io::Result<u64> {
     if *inner_position != u64::MAX {
         debug_assert_eq!(*inner_position, inner.stream_position()?);
         return Ok(*inner_position);
@@ -325,7 +331,7 @@ fn obtain_stream_position<T:Seek>(inner: &mut T, inner_position: &mut u64) -> st
     Ok(*inner_position)
 }
 
-impl<T:Read+Write+Seek+std::fmt::Debug> BufRead for BufStream<T> {
+impl<T: Read + Write + Seek + std::fmt::Debug> BufRead for BufStream<T> {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         let buf_end = checked_add(self.buffer.offset, self.buffer.data.len())?;
         if self.position >= self.buffer.offset && self.position < buf_end {
@@ -341,7 +347,6 @@ impl<T:Read+Write+Seek+std::fmt::Debug> BufRead for BufStream<T> {
         debug_assert!(self.buffer.data.len() > 0);
         let mut dropguard = DropGuard(&mut self.buffer.data);
 
-
         if obtain_stream_position(&mut self.inner, &mut self.inner_position)? != self.position {
             self.inner.seek(SeekFrom::Start(self.position))?;
         }
@@ -356,32 +361,33 @@ impl<T:Read+Write+Seek+std::fmt::Debug> BufRead for BufStream<T> {
     }
 
     fn consume(&mut self, amt: usize) {
-        self.position = checked_add(self.position, amt)
-            .expect("u64::MAX offset cannot be exceeded");
+        self.position =
+            checked_add(self.position, amt).expect("u64::MAX offset cannot be exceeded");
     }
 }
 
-impl <T: Write + Seek> BufStream<T> {
+impl<T: Write + Seek> BufStream<T> {
     #[cold]
     #[inline(never)]
     fn write_cold(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.write_at(self.position, buf,
+        self.buffer.write_at(self.position, buf, &mut |pos, data| {
+            if obtain_stream_position(&mut self.inner, &mut self.inner_position)? != pos as u64 {
+                let t = self.inner.seek(SeekFrom::Start(pos as u64));
+                t?;
+            }
+            self.inner_position = u64::MAX;
+            let t = self.inner.write_all(data);
+            t?;
+            self.inner_position = checked_add(pos, data.len())?;
+            Ok(())
+        })?;
 
-                             &mut |pos, data| {
-                                 if
-                                 obtain_stream_position(&mut self.inner, &mut self.inner_position)? != pos as u64 {
-                                     let t = self.inner.seek(SeekFrom::Start(pos as u64));
-                                     t?;
-                                 }
-                                 self.inner_position = u64::MAX;
-                                 let t = self.inner.write_all(data);
-                                 t?;
-                                 self.inner_position = checked_add(pos, data.len())?;
-                                 Ok(())
-                             })?;
-
-        self.position = self.position.checked_add(to_u64(buf.len())?)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))?;
+        self.position = self
+            .position
+            .checked_add(to_u64(buf.len())?)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow")
+            })?;
 
         Ok(buf.len())
     }
@@ -390,14 +396,15 @@ impl <T: Write + Seek> BufStream<T> {
 impl<T: Write + Seek> Write for BufStream<T> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let free_capacity = self.buffer.data.capacity() - self.buffer.data.len();
-        if self.position == self.buffer.offset+self.buffer.data.len() as u64 && free_capacity >= buf.len() {
+        if self.position == self.buffer.offset + self.buffer.data.len() as u64
+            && free_capacity >= buf.len()
+        {
             self.buffer.data.extend(buf);
             self.position = checked_add(self.position, buf.len())?;
             return Ok(buf.len());
         }
         self.write_cold(buf)
     }
-
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.flush_write()?;
@@ -408,8 +415,7 @@ impl<T: Write + Seek> Write for BufStream<T> {
 impl<T: Write + Seek> BufStream<T> {
     fn flush_write(&mut self) -> Result<(), std::io::Error> {
         let t = self.buffer.flush(&mut |offset, data| {
-            if offset != obtain_stream_position(&mut self.inner, &mut self.inner_position)?
-            {
+            if offset != obtain_stream_position(&mut self.inner, &mut self.inner_position)? {
                 self.inner.seek(SeekFrom::Start(offset as u64))?;
             }
             self.inner_position = u64::MAX;
@@ -438,7 +444,7 @@ impl<T: Write + Seek> BufStream<T> {
     }
 }
 
-impl<T: Write+Seek> Seek for BufStream<T> {
+impl<T: Write + Seek> Seek for BufStream<T> {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         match pos {
             SeekFrom::Start(pos) => {
@@ -451,8 +457,9 @@ impl<T: Write+Seek> Seek for BufStream<T> {
                 self.position = pos;
             }
             SeekFrom::Current(delta) => {
-                self.position = self.position.checked_add_signed(delta )
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Seek index out of range"))?;
+                self.position = self.position.checked_add_signed(delta).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "Seek index out of range")
+                })?;
             }
         }
         Ok(self.position as u64)
@@ -492,18 +499,17 @@ impl<T: Read + Seek + Write> BufStream<T> {
             },
         )?;
         debug_assert!(got <= buf.len());
-        self.position = checked_add(self.position,got)?;
+        self.position = checked_add(self.position, got)?;
         Ok(got)
     }
-
 }
 
 impl<T: Read + Seek + Write> Read for BufStream<T> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if let Some(offset) = self.position.checked_sub(self.buffer.offset) {
-            if (offset as u64 ) < self.buffer.data.len().saturating_sub(buf.len()) as u64 {
+            if (offset as u64) < self.buffer.data.len().saturating_sub(buf.len()) as u64 {
                 let offset = offset as usize;
-                buf.copy_from_slice(&self.buffer.data[offset..offset+buf.len()]);
+                buf.copy_from_slice(&self.buffer.data[offset..offset + buf.len()]);
 
                 self.position = checked_add(self.position, buf.len())?;
 
@@ -516,9 +522,9 @@ impl<T: Read + Seek + Write> Read for BufStream<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::ErrorKind;
     use super::*;
     use rand::{Rng, RngCore};
+    use std::io::ErrorKind;
     use std::panic;
     use std::panic::AssertUnwindSafe;
 
@@ -921,7 +927,6 @@ mod tests {
                             cut.consume(len);
                             Ok(len)
                         });
-
                     } else {
                         cut_got = catch(&mut || cut.read(&mut cutbuf));
                     }
@@ -938,7 +943,10 @@ mod tests {
                             if good_got > 0 {
                                 assert!(cut_got > 0);
                             }
-                            if short_read == 0 && good.position + read_bytes <= good.buf.len() && !bufread {
+                            if short_read == 0
+                                && good.position + read_bytes <= good.buf.len()
+                                && !bufread
+                            {
                                 assert_eq!(cut_got, good_got);
                                 assert_eq!(cut_got, read_bytes);
                             }

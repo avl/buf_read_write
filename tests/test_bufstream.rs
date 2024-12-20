@@ -1,7 +1,7 @@
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use bufstream2::BufStream;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 #[test]
 fn test_bufstream() {
@@ -12,10 +12,10 @@ fn test_bufstream() {
     stream.seek(SeekFrom::Start(1)).unwrap();
     stream.write_all(&[42]).unwrap();
 
-    let mut data = [0,0];
+    let mut data = [0, 0];
     stream.seek(SeekFrom::Start(1)).unwrap();
     stream.read(&mut data).unwrap();
-    assert_eq!(data,[42,3]);
+    assert_eq!(data, [42, 3]);
 }
 
 #[test]
@@ -34,7 +34,6 @@ fn test_seeks() {
     stream.read(&mut buf).unwrap();
     assert_eq!(buf[0], 1);
 
-
     stream.seek(SeekFrom::Current(0)).unwrap();
     let mut buf = [0];
     stream.read(&mut buf).unwrap();
@@ -48,21 +47,20 @@ fn test_seeks() {
     stream.seek(SeekFrom::End(-5)).unwrap();
     stream.seek(SeekFrom::Current(i64::MIN)).unwrap_err();
     stream.seek(SeekFrom::End(-6)).unwrap_err();
-
 }
 
 #[derive(Default)]
 struct Instrumentation {
-    writes:  AtomicUsize,
-    reads:   AtomicUsize,
-    seeks:   AtomicUsize,
+    writes: AtomicUsize,
+    reads: AtomicUsize,
+    seeks: AtomicUsize,
     flushes: AtomicUsize,
 }
 
 #[derive(Default)]
 struct InstrumentedCursor {
     cursor: Cursor<Vec<u8>>,
-    instrumentation: Arc<Instrumentation>
+    instrumentation: Arc<Instrumentation>,
 }
 
 impl Read for InstrumentedCursor {
@@ -89,11 +87,9 @@ impl Seek for InstrumentedCursor {
     }
 }
 
-
 #[test]
 fn test_writes_are_buffered() {
-    let writer =
-        InstrumentedCursor::default();
+    let writer = InstrumentedCursor::default();
     let instrumentation = writer.instrumentation.clone();
     let mut bufstream = BufStream::new(writer);
 
@@ -106,8 +102,7 @@ fn test_writes_are_buffered() {
 }
 #[test]
 fn test_seeks_are_virtualized() {
-    let writer =
-        InstrumentedCursor::default();
+    let writer = InstrumentedCursor::default();
     let instrumentation = writer.instrumentation.clone();
     let mut bufstream = BufStream::new(writer);
 
@@ -120,8 +115,7 @@ fn test_seeks_are_virtualized() {
 }
 #[test]
 fn test_reads_are_buffered() {
-    let cursor =
-        InstrumentedCursor::default();
+    let cursor = InstrumentedCursor::default();
     let instrumentation = cursor.instrumentation.clone();
     let mut bufstream = BufStream::new(cursor);
 
