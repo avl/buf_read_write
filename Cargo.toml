@@ -10,3 +10,8 @@ repository = "https://github.com/avl/bufstream2"
 
 [dev-dependencies]
 rand = { version = "0.8", features = ["small_rng"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "bufstream_benchmark"
+harness = false

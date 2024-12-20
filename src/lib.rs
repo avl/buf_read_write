@@ -32,30 +32,37 @@
 //!   reading, will invalidate the buffer (writing it back correctly to the backing
 //!   implementation).
 //!
-//! * It is not a caching subsystem. Reads and writes larger than the buffer size will
-//!   be satisfied by bypassing the buffer.
+//! * Bufstream2 is not a disk cache. Reads and writes larger than the buffer size will
+//!   be satisfied by bypassing the buffer. The purpose of Bufstream2 is only to provide
+//!   acceptable performance when doing small reads/writes.
 //!
-//! * Buffered reads assume the file is being traversed forward. Reading position 100
+//! * Buffered reads assume the file is being traversed forward. Reading position 2000
 //!   with a buffer size of 1000, will result in a call to the backing implementation of
-//!   bytes `100..1100`.
+//!   bytes `2000..3000`.
 //!
 //! * All writes behave like [`std::io::Write::write_all`]. This simplifies the implementation,
 //!   and is often what you want for disk io (the main use case for this library). Even
 //!   [`std::io::BufWriter`] will effectively do this when it is flushing its IO buffer.
 //!
-//! * Seeks are not immediately passed on to the backing implementation. Instead, before
+//! * Seeks are not always immediately passed on to the backing implementation. Instead, before
 //!   each read, a seek is issued if required. This makes sense, since when the buffer needs
 //!   to be flushed, extra seeks might otherwise be needed.
+//!   NOTE! SeekFrom::End() *does* cause a flush and an immediate call to the backing
+//!   implementation. This is due to the need for seeking to determine the end of the stream.
 //!
 //! * This crate does not attempt to support files larger than 2^64 bytes. Seeking this far
-//!   is impossible because of type ranges, but this crate makes no attempt at allowing even
-//!   writes to proceed beyond this limitation.
+//!   is always impossible because of type ranges. But this crate additionally does not support
+//!   writing beyond the end of this limit, even if no seeks occur. Because of how large 2^64
+//!   is, this is unlikely to be a problem in practice.
 //!
 //! # Implementation
 //!
-//! * This crate contains extensive test-routines.
+//! * An extensive test suite exists, including automatic chaos testing, exhaustive testing
+//!   for simple cases, and 'cargo mutants'-testing.
 //!
+//! * No unsafe code is used
 //!
+//! * Bufstream2 has no dependencies (apart from dev-dependencies)
 //!
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
@@ -65,6 +72,10 @@ use std::cell::RefCell;
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::mem::forget;
 use std::ops::Range;
+
+
+const DEFAULT_BUF_SIZE: usize = 8192;
+
 
 #[derive(Clone, Debug)]
 struct MovingBuffer {
@@ -96,15 +107,18 @@ fn overlap(range1: Range<u64>, range2: Range<u64>) -> Option<Range<u64>> {
     Some(range1.start.max(range2.start)..range1.end.min(range2.end))
 }
 
+#[inline(always)]
 fn checked_add(position: u64, size: usize) -> std::io::Result<u64> {
     position.checked_add(size.try_into()
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))?)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))
 }
+#[inline(always)]
 fn checked_add_usize(position: usize, size:usize) -> std::io::Result<usize> {
     position.checked_add(size)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))
 }
+#[inline(always)]
 fn checked_sub_u64(position: u64, size:u64) -> std::io::Result<u64> {
     position.checked_sub(size)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic underflow"))
@@ -137,6 +151,7 @@ impl MovingBuffer {
         }
     }
 
+    #[inline]
     fn flush(
         &mut self,
         flusher: &mut impl FnMut(u64, &[u8]) -> Result<(), std::io::Error>,
@@ -147,10 +162,11 @@ impl MovingBuffer {
         self.data.clear();
         Ok(())
     }
-    #[inline]
+    #[inline(always)]
     fn end(&self) -> Result<u64, std::io::Error> {
         checked_add(self.offset, self.data.len())
     }
+    #[inline(always)]
     fn write_at(
         &mut self,
         position: u64,
@@ -182,6 +198,7 @@ impl MovingBuffer {
         }
     }
 
+    #[inline(always)]
     fn read_at<
         R: FnMut(u64, &mut [u8]) -> std::io::Result<usize>,
         W: FnMut(u64, &[u8]) -> std::io::Result<()>,
@@ -198,6 +215,7 @@ impl MovingBuffer {
         }
         _ = checked_add(position, buf.len())?;
 
+        #[inline(never)]
         fn inner_read_at<
             F: FnMut(u64, &mut [u8]) -> std::io::Result<usize>,
             W: FnMut(u64, &[u8]) -> std::io::Result<()>,
@@ -217,6 +235,7 @@ impl MovingBuffer {
             _ = checked_add(position, cap)?;
             tself.data.resize(cap, 0);
             tself.offset = position;
+
             let mut dropguard = DropGuard(&mut tself.data);
             let got = read_at(position, &mut dropguard.0)?;
             dropguard.0.truncate(got);
@@ -276,6 +295,7 @@ impl MovingBuffer {
 pub struct BufStream<T> {
     buffer: MovingBuffer,
     position: u64,
+    inner_position: u64,
     inner: T,
 }
 
@@ -289,12 +309,21 @@ impl<T> BufStream<T> {
             buffer: self.buffer.clone(),
             position: self.position,
             inner: self.inner.clone(),
+            inner_position: self.inner_position,
         }
     }
 }
 
-const DEFAULT_BUF_SIZE: usize = 8192;
 
+#[inline]
+fn obtain_stream_position<T:Seek>(inner: &mut T, inner_position: &mut u64) -> std::io::Result<u64> {
+    if *inner_position != u64::MAX {
+        debug_assert_eq!(*inner_position, inner.stream_position()?);
+        return Ok(*inner_position);
+    }
+    *inner_position = inner.stream_position()?;
+    Ok(*inner_position)
+}
 
 impl<T:Read+Write+Seek+std::fmt::Debug> BufRead for BufStream<T> {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
@@ -302,27 +331,27 @@ impl<T:Read+Write+Seek+std::fmt::Debug> BufRead for BufStream<T> {
         if self.position >= self.buffer.offset && self.position < buf_end {
             let usable = to_usize(buf_end - self.position)?;
             debug_assert!(usable > 0);
-            let buf_offset = to_usize(self.position - self.buffer.offset)?;
-            return Ok(&self.buffer.data[buf_offset..buf_offset + usable]);
+            let buf_offset = to_usize(checked_sub_u64(self.position, self.buffer.offset)?)?;
+            return Ok(&self.buffer.data[buf_offset..checked_add_usize(buf_offset, usable)?]);
         }
-        println!("fillbuf, pre fluish: {:?}", self);
         self.flush_write()?;
-        println!("fillbuf, post fluish: {:?}", self);
         let cap = self.buffer.data.capacity();
         self.buffer.data.resize(cap, 0);
         self.buffer.offset = self.position;
         debug_assert!(self.buffer.data.len() > 0);
         let mut dropguard = DropGuard(&mut self.buffer.data);
 
-        if self.inner.stream_position()? != self.position {
+
+        if obtain_stream_position(&mut self.inner, &mut self.inner_position)? != self.position {
             self.inner.seek(SeekFrom::Start(self.position))?;
         }
+        self.inner_position = u64::MAX;
 
         let got = self.inner.read(&mut dropguard.0)?;
         dropguard.0.truncate(got);
+        self.inner_position = checked_add(self.position, got)?;
         forget(dropguard);
         dbg!(got);
-        println!("fillbuf, pre ret: {:?}", self);
         Ok(&self.buffer.data)
     }
 
@@ -332,23 +361,43 @@ impl<T:Read+Write+Seek+std::fmt::Debug> BufRead for BufStream<T> {
     }
 }
 
-impl<T: Write + Seek> Write for BufStream<T> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.write_at(self.position, buf, &mut |pos, data| {
-            if self.inner.stream_position()? != pos as u64 {
-                let t = self.inner.seek(SeekFrom::Start(pos as u64));
-                t?;
-            }
-            let t = self.inner.write_all(data);
-            t?;
-            Ok(())
-        })?;
+impl <T: Write + Seek> BufStream<T> {
+    #[cold]
+    #[inline(never)]
+    fn write_cold(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.write_at(self.position, buf,
+
+                             &mut |pos, data| {
+                                 if
+                                 obtain_stream_position(&mut self.inner, &mut self.inner_position)? != pos as u64 {
+                                     let t = self.inner.seek(SeekFrom::Start(pos as u64));
+                                     t?;
+                                 }
+                                 self.inner_position = u64::MAX;
+                                 let t = self.inner.write_all(data);
+                                 t?;
+                                 self.inner_position = checked_add(pos, data.len())?;
+                                 Ok(())
+                             })?;
 
         self.position = self.position.checked_add(to_u64(buf.len())?)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))?;
 
         Ok(buf.len())
     }
+}
+
+impl<T: Write + Seek> Write for BufStream<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let free_capacity = self.buffer.data.capacity() - self.buffer.data.len();
+        if self.position == self.buffer.offset+self.buffer.data.len() as u64 && free_capacity >= buf.len() {
+            self.buffer.data.extend(buf);
+            self.position = checked_add(self.position, buf.len())?;
+            return Ok(buf.len());
+        }
+        self.write_cold(buf)
+    }
+
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.flush_write()?;
@@ -359,11 +408,14 @@ impl<T: Write + Seek> Write for BufStream<T> {
 impl<T: Write + Seek> BufStream<T> {
     fn flush_write(&mut self) -> Result<(), std::io::Error> {
         let t = self.buffer.flush(&mut |offset, data| {
-            if offset != self.inner.stream_position()? {
+            if offset != obtain_stream_position(&mut self.inner, &mut self.inner_position)?
+            {
                 self.inner.seek(SeekFrom::Start(offset as u64))?;
             }
+            self.inner_position = u64::MAX;
 
             self.inner.write_all(data)?;
+            self.inner_position = checked_add(offset, data.len())?;
             Ok(())
         });
         t?;
@@ -375,6 +427,7 @@ impl<T: Write + Seek> BufStream<T> {
         Self {
             buffer: MovingBuffer::with_capacity(capacity),
             position: 0,
+            inner_position: u64::MAX,
             inner,
         }
     }
@@ -385,18 +438,17 @@ impl<T: Write + Seek> BufStream<T> {
     }
 }
 
-impl<T: Seek> Seek for BufStream<T> {
+impl<T: Write+Seek> Seek for BufStream<T> {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         match pos {
             SeekFrom::Start(pos) => {
                 self.position = pos;
             }
             SeekFrom::End(e) => {
-                let buf_end = checked_add(self.buffer.offset, self.buffer.data.len())?;
-
-                self.position = (self.inner.stream_position()?).max(buf_end)
-                    .checked_add_signed(e)
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Seek index out of range"))?;
+                self.flush_write()?;
+                let pos = self.inner.seek(SeekFrom::End(e))?;
+                self.inner_position = pos;
+                self.position = pos;
             }
             SeekFrom::Current(delta) => {
                 self.position = self.position.checked_add_signed(delta )
@@ -406,9 +458,12 @@ impl<T: Seek> Seek for BufStream<T> {
         Ok(self.position as u64)
     }
 }
-impl<T: Read + Seek + Write> Read for BufStream<T> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl<T: Read + Seek + Write> BufStream<T> {
+    #[cold]
+    #[inline(never)]
+    fn read_cold(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let inner = RefCell::new(&mut self.inner);
+        let inner_position = RefCell::new(&mut self.inner_position);
         let got = self.buffer.read_at(
             self.position,
             buf,
@@ -417,7 +472,9 @@ impl<T: Read + Seek + Write> Read for BufStream<T> {
                 if inner.stream_position()? != pos as u64 {
                     inner.seek(SeekFrom::Start(pos as u64))?;
                 }
+                **inner_position.borrow_mut() = u64::MAX;
                 let got = inner.read(data)?;
+                **inner_position.borrow_mut() = checked_add(pos, got)?;
                 debug_assert!(got <= data.len());
                 Ok(got)
             },
@@ -426,14 +483,34 @@ impl<T: Read + Seek + Write> Read for BufStream<T> {
                 if offset != inner.stream_position()? {
                     inner.seek(SeekFrom::Start(offset as u64))?;
                 }
+                **inner_position.borrow_mut() = u64::MAX;
 
                 inner.write_all(data)?;
+
+                **inner_position.borrow_mut() = checked_add(offset, data.len())?;
                 Ok(())
             },
         )?;
         debug_assert!(got <= buf.len());
         self.position = checked_add(self.position,got)?;
         Ok(got)
+    }
+
+}
+
+impl<T: Read + Seek + Write> Read for BufStream<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(offset) = self.position.checked_sub(self.buffer.offset) {
+            if (offset as u64 ) < self.buffer.data.len().saturating_sub(buf.len()) as u64 {
+                let offset = offset as usize;
+                buf.copy_from_slice(&self.buffer.data[offset..offset+buf.len()]);
+
+                self.position = checked_add(self.position, buf.len())?;
+
+                return Ok(buf.len());
+            }
+        }
+        self.read_cold(buf)
     }
 }
 
@@ -479,7 +556,6 @@ mod tests {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             self.maybe_panic()?;
 
-            println!("Fakestream read {}: {:?}", buf.len(), self);
             let mut to_read = buf.len();
 
             if to_read > 1 && self.short_read_by > 0 {
