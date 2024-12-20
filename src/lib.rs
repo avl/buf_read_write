@@ -41,8 +41,8 @@
 //!   bytes `2000..3000`.
 //!
 //! * All writes behave like [`std::io::Write::write_all`]. This simplifies the implementation,
-//!   and is often what you want for disk io (the main use case for this library). Even
-//!   [`std::io::BufWriter`] will effectively do this when it is flushing its IO buffer.
+//!   and is often what you want for disk io (the main use case for this library).
+//!   ([`std::io::BufWriter`] also effectively does this when it is flushing its IO buffer).
 //!
 //! * Seeks are not always immediately passed on to the backing implementation. Instead, before
 //!   each read, a seek is issued if required. This makes sense, since when the buffer needs
@@ -50,8 +50,8 @@
 //!   NOTE! SeekFrom::End() *does* cause a flush and an immediate call to the backing
 //!   implementation. This is due to the need for seeking to determine the end of the stream.
 //!
-//! * This crate does not attempt to support files larger than 2^64 bytes. Seeking this far
-//!   is always impossible because of type ranges. But this crate additionally does not support
+//! * This crate does not attempt to support files larger than 2^64 bytes. Seeking directly this
+//!   far is always impossible because of type ranges. But this crate additionally does not support
 //!   writing beyond the end of this limit, even if no seeks occur. Because of how large 2^64
 //!   is, this is unlikely to be a problem in practice.
 //!
@@ -71,7 +71,7 @@
 //!   backing implementation.
 //!   For disk IO, this can be acceptable, since writing a whole buffer may be equally
 //!   fast as writing two smaller buffers. If this behavior is not desired, consider
-//!   flushing the buffer between writes.
+//!   flushing the buffer between such writes.
 //!
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
@@ -175,7 +175,7 @@ impl MovingBuffer {
         &mut self,
         flusher: &mut impl FnMut(u64, &[u8]) -> Result<(), std::io::Error>,
     ) -> Result<(), std::io::Error> {
-        if !self.data.is_empty() {
+        if !self.data.is_empty() && !self.dirty.is_empty() {
             flusher(
                 self.offset + self.dirty.start as u64,
                 &self.data[self.dirty.clone()],
@@ -319,18 +319,24 @@ impl MovingBuffer {
     }
 }
 
-/// Buffering reader/writer
+/// Buffering reader/writer.
+///
+/// Note that T must implement both [`std::io::Seek`] and [`std::io::Write`]. The reason
+/// for this is that this is needed so that Drop can flush any unwritten data.
 ///
 /// See crate documentation for more details!
 #[derive(Debug)]
-pub struct BufStream<T> {
+pub struct BufStream<T>
+where
+    T: Seek + Write,
+{
     buffer: MovingBuffer,
     position: u64,
     inner_position: u64,
     inner: T,
 }
 
-impl<T> BufStream<T> {
+impl<T: Seek + Write> BufStream<T> {
     #[cfg(test)]
     pub(crate) fn clone(&self) -> Self
     where
@@ -442,6 +448,12 @@ impl<T: Write + Seek> Write for BufStream<T> {
     }
 }
 
+impl<T: Write + Seek> Drop for BufStream<T> {
+    fn drop(&mut self) {
+        _ = self.flush_write();
+    }
+}
+
 impl<T: Write + Seek> BufStream<T> {
     fn flush_write(&mut self) -> Result<(), std::io::Error> {
         let t = self.buffer.flush(&mut |offset, data| {
@@ -460,7 +472,7 @@ impl<T: Write + Seek> BufStream<T> {
     }
 }
 
-impl<T> BufStream<T> {
+impl<T: Seek + Write> BufStream<T> {
     /// Crate a new instance, wrapping `inner`, with the given buffer size.
     ///
     /// Note:
@@ -596,6 +608,7 @@ mod tests {
         short_read_by: usize,
         panic_after: usize,
         err_after: usize,
+        writes_have_occurred: bool,
     }
     impl FakeStream {
         fn repair(&mut self) {
@@ -641,10 +654,11 @@ mod tests {
     }
     impl Write for FakeStream {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes_have_occurred = true;
             self.maybe_panic()?;
             for b in buf {
                 if self.position >= self.buf.len() {
-                    assert!(self.position <= self.buf.len());
+                    self.buf.resize(self.position, 0);
                     self.buf.push(*b);
                 } else {
                     self.buf[self.position] = *b;
@@ -833,6 +847,55 @@ mod tests {
         let mut cut = BufStream::with_capacity(cut_inner, 100);
         cut.write(&[1, 2, 3]).unwrap();
         assert!(cut.inner.buf.is_empty());
+    }
+
+    #[test]
+    fn can_seek_far_beyond_end() {
+        let cut_inner = FakeStream::default();
+        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        cut.seek(SeekFrom::Start(200)).unwrap();
+        cut.write(&[1, 2, 3]).unwrap();
+        cut.flush().unwrap();
+        assert_eq!(cut.inner.buf.len(), 203);
+    }
+
+    #[test]
+    fn can_write_beyond_end() {
+        let cut_inner = FakeStream::default();
+        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        cut.write(&[1, 2, 3]).unwrap();
+        cut.flush().unwrap();
+        cut.seek(SeekFrom::Start(3)).unwrap();
+        cut.write(&[1, 2, 3]).unwrap();
+        cut.flush().unwrap();
+        assert_eq!(cut.inner.buf.len(), 6);
+    }
+
+    #[test]
+    fn reading_does_not_cause_writes() {
+        let mut cut_inner = FakeStream::default();
+        cut_inner.write(&[1, 2, 3, 4, 5]).unwrap();
+        cut_inner.writes_have_occurred = false;
+        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        cut.seek(SeekFrom::Start(1)).unwrap();
+        let mut buf = [0, 0, 0];
+        cut.read(&mut buf).unwrap();
+        assert_eq!(buf, [2, 3, 4]);
+        cut.flush().unwrap();
+        assert!(!cut.inner.writes_have_occurred);
+    }
+
+    #[test]
+    fn can_seek_and_write_just_beyond_end() {
+        let cut_inner = FakeStream::default();
+        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        cut.write(&[1, 2, 3]).unwrap();
+        cut.flush().unwrap();
+        cut.seek(SeekFrom::Start(4)).unwrap();
+        cut.write(&[1, 2, 3]).unwrap();
+        cut.flush().unwrap();
+        assert_eq!(cut.inner.buf, [1, 2, 3, 0, 1, 2, 3]);
+        assert_eq!(cut.inner.buf.len(), 7);
     }
     #[test]
     fn stream_position_is_reloaded() {
