@@ -86,7 +86,7 @@ struct MovingBuffer {
 macro_rules! debug_println {
     ($f:expr, $($a:expr),+) => {{
         // Enable this if you need to debug
-        //println!($f, $($a),+ );
+        // println!($f, $($a),+ );
     }};
 }
 
@@ -349,6 +349,7 @@ impl<T: Read + Write + Seek + std::fmt::Debug> BufRead for BufStream<T> {
         let mut dropguard = DropGuard(&mut self.buffer.data);
 
         if obtain_stream_position(&mut self.inner, &mut self.inner_position)? != self.position {
+            self.inner_position = u64::MAX;
             self.inner.seek(SeekFrom::Start(self.position))?;
         }
         self.inner_position = u64::MAX;
@@ -373,6 +374,7 @@ impl<T: Write + Seek> BufStream<T> {
     fn write_cold(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.buffer.write_at(self.position, buf, &mut |pos, data| {
             if obtain_stream_position(&mut self.inner, &mut self.inner_position)? != pos as u64 {
+                self.inner_position = u64::MAX;
                 let t = self.inner.seek(SeekFrom::Start(pos as u64));
                 t?;
             }
@@ -417,6 +419,7 @@ impl<T: Write + Seek> BufStream<T> {
     fn flush_write(&mut self) -> Result<(), std::io::Error> {
         let t = self.buffer.flush(&mut |offset, data| {
             if offset != obtain_stream_position(&mut self.inner, &mut self.inner_position)? {
+                self.inner_position = u64::MAX;
                 self.inner.seek(SeekFrom::Start(offset as u64))?;
             }
             self.inner_position = u64::MAX;
@@ -477,25 +480,31 @@ impl<T: Read + Seek + Write> BufStream<T> {
             buf,
             &mut |pos, data| {
                 let mut inner = inner.borrow_mut();
-                if inner.stream_position()? != pos as u64 {
-                    inner.seek(SeekFrom::Start(pos as u64))?;
+
+                let mut inner_position = inner_position.borrow_mut();
+
+                if obtain_stream_position(&mut *inner, &mut *inner_position)? != pos {
+                    **inner_position = u64::MAX;
+                    inner.seek(SeekFrom::Start(pos))?;
                 }
-                **inner_position.borrow_mut() = u64::MAX;
+                **inner_position = u64::MAX;
                 let got = inner.read(data)?;
-                **inner_position.borrow_mut() = checked_add(pos, got)?;
+                **inner_position = checked_add(pos, got)?;
                 debug_assert!(got <= data.len());
                 Ok(got)
             },
             &mut |offset, data| {
+                let mut inner_position = inner_position.borrow_mut();
                 let mut inner = inner.borrow_mut();
-                if offset != inner.stream_position()? {
-                    inner.seek(SeekFrom::Start(offset as u64))?;
+                if offset != obtain_stream_position(&mut *inner, &mut *inner_position)? {
+                    **inner_position = u64::MAX;
+                    inner.seek(SeekFrom::Start(offset))?;
                 }
-                **inner_position.borrow_mut() = u64::MAX;
+                **inner_position = u64::MAX;
 
                 inner.write_all(data)?;
 
-                **inner_position.borrow_mut() = checked_add(offset, data.len())?;
+                **inner_position = checked_add(offset, data.len())?;
                 Ok(())
             },
         )?;
@@ -774,6 +783,16 @@ mod tests {
         cut.write(&[1, 2, 3]).unwrap();
         assert!(cut.inner.buf.is_empty());
     }
+    #[test]
+    fn stream_position_is_reloaded() {
+        let cut_inner = FakeStream::default();
+        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        cut.write(&[1]).unwrap();
+        cut.inner_position = u64::MAX;
+        cut.flush().unwrap();
+        cut.write(&[2]).unwrap();
+        cut.flush().unwrap();
+    }
 
     #[test]
     fn writes_are_buffered_after_seek() {
@@ -871,18 +890,18 @@ mod tests {
             let mut panic_or_err = false;
             if small_rng.gen_bool(0.05) {
                 good.panic_after = 1;
-                cut.inner.panic_after = 1;
+                cut.inner.panic_after = small_rng.gen_range(1..4);
                 panic_or_err = true;
             } else if small_rng.gen_bool(0.05) {
                 good.err_after = 1;
-                cut.inner.err_after = 1;
+                cut.inner.err_after = small_rng.gen_range(1..4);
                 panic_or_err = true;
             }
             match small_rng.gen_range(0..3) {
                 0 if good.buf.len() > 0 => {
                     let seek_to = small_rng.gen_range(0..good.buf.len());
 
-                    debug_println!("==SEEK to {}", seek_to);
+                    debug_println!("==SEEK to {} [{:?}]", seek_to, panic_or_err);
                     let re_good = catch(&mut || good.seek(SeekFrom::Start(seek_to as u64)));
                     let re_cut = catch(&mut || cut.seek(SeekFrom::Start(seek_to as u64)));
 
@@ -907,7 +926,7 @@ mod tests {
                     //Read
                     let read_bytes = small_rng.gen_range(0..write_sizes);
                     let short_read = small_rng.gen_bool(0.3) as usize;
-                    debug_println!("==READ {}", read_bytes);
+                    debug_println!("==READ {} [{:?}]", read_bytes, panic_or_err);
                     let mut goodbuf = vec![0u8; read_bytes];
                     good.short_read_by = short_read;
                     let good_got = catch(&mut || good.read(&mut goodbuf));
@@ -933,11 +952,12 @@ mod tests {
                     }
 
                     debug_println!(
-                        "did READ {:?}/{} -> {:?} (short-read: {})",
+                        "did READ {:?}/{} -> {:?} (short-read: {}) [{:?}]",
                         cut_got,
                         read_bytes,
                         cutbuf,
-                        short_read
+                        short_read,
+                        panic_or_err
                     );
                     match (good_got, cut_got) {
                         (Ok(good_got), Ok(cut_got)) => {
@@ -973,7 +993,7 @@ mod tests {
                     let write_bytes = small_rng.gen_range(0..write_sizes);
                     let mut buf = vec![0u8; write_bytes];
                     small_rng.fill_bytes(&mut buf);
-                    debug_println!("==WRITE {} {:?}", buf.len(), buf);
+                    debug_println!("==WRITE {} {:?} [{:?}]", buf.len(), buf, panic_or_err);
                     let good_got = catch(&mut || good.write(&buf));
                     let cut_got = catch(&mut || cut.write(&buf));
                     match (good_got, cut_got) {
