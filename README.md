@@ -3,6 +3,10 @@
 [Repo](https://github.com/avl/buf_read_write)
 [Docs](https://docs.rs/buf_read_write/latest/buf_read_write/)
 
+![build](https://github.com/avl/arcshift/actions/workflows/rust.yml/badge.svg)
+![build](https://github.com/avl/arcshift/actions/workflows/mutants.yml/badge.svg)
+![build](https://github.com/avl/arcshift/actions/workflows/clippy.yml/badge.svg)
+
 This crate contains a a buffered io implementation, a combination of `std::io::BufReader`
 and `std::io::BufWriter`. This allows buffered input and output, for example with a `std::fs::File`.
 
