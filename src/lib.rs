@@ -357,7 +357,7 @@ impl<T: Read + Seek + Write> Read for BufStream<T> {
 mod tests {
     use std::mem::transmute;
     use std::panic;
-    use std::panic::UnwindSafe;
+    use std::panic::{AssertUnwindSafe, UnwindSafe};
     use super::*;
     use rand::{Rng, RngCore};
 
@@ -609,12 +609,9 @@ mod tests {
     }
 
     fn catch<R>(f: &mut dyn FnMut() -> std::io::Result<R>) -> std::io::Result<R> {
-        let mut fat: [usize;2];
-        fat = unsafe{ transmute(f as *mut _ )};
-        let f = Smuggler(fat);
+
+        let f = AssertUnwindSafe(f);
         match panic::catch_unwind(|| {
-            let f : *mut dyn FnMut() -> std::io::Result<R> = unsafe { transmute(fat) };
-            let f = unsafe {&mut *f};
             (f)()
         }) {
             Ok(ok) => {
