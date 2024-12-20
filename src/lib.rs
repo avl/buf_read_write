@@ -82,9 +82,12 @@ impl MovingBuffer {
         }
     }
 
-    fn read_at<F: FnMut(usize,  &mut [u8]) -> std::io::Result<usize>>(&mut self, position: usize, buf: &mut [u8],
-                                                                   read_at: &mut F,
-                                                                   write_at: &mut impl FnMut(usize,  &[u8]) -> Result<(), std::io::Error>,
+    fn read_at<
+        R: FnMut(usize,  &mut [u8]) -> std::io::Result<usize>,
+        W: FnMut(usize,  &[u8]) -> std::io::Result<()>,
+    >(&mut self, position: usize, buf: &mut [u8],
+                                                                      read_at: &mut R,
+                                                                      write_at: &mut W,
     ) -> std::io::Result<usize> {
 
         if buf.len() > self.data.capacity() {
@@ -92,11 +95,23 @@ impl MovingBuffer {
             return read_at(position, buf);
         }
 
+        fn inner_read_at<
+            F: FnMut(usize,  &mut [u8]) -> std::io::Result<usize>,
+            W: FnMut(usize,  &[u8]) -> std::io::Result<()>,
+        >(position: usize, buf: &mut [u8], tself: &mut MovingBuffer, read_at: &mut F, write_at: &mut W) -> std::io::Result<usize> {
 
-        fn inner_read_at<F: FnMut(usize,  &mut [u8]) -> std::io::Result<usize>>(position: usize, buf: &mut [u8], tself: &mut MovingBuffer, read_at: &mut F) -> std::io::Result<usize> {
-
-
-            read_at(position, buf)
+            if buf.len() == 0 {
+                return Ok(0);
+            }
+            tself.flush(write_at)?;
+            let cap = tself.data.capacity();
+            tself.data.resize(cap, 0);
+            tself.offset = position;
+            let got = read_at(position, &mut tself.data)?;
+            tself.data.truncate(got);
+            let curgot = got.min(buf.len());
+            buf[..curgot].copy_from_slice(&tself.data[0..curgot]);
+            Ok(got)
         }
 
         let read_range = position .. position+buf.len();
@@ -105,10 +120,10 @@ impl MovingBuffer {
         let buflen = buf.len();
 
         if read_range.end <= buffered_range.start {
-            return inner_read_at(read_range.start, buf, self, read_at);
+            return inner_read_at(read_range.start, buf, self, read_at, write_at);
         }
         if read_range.start >= buffered_range.end {
-            return inner_read_at(read_range.start, buf, self, read_at);
+            return inner_read_at(read_range.start, buf, self, read_at, write_at);
         }
 
         let mut got =0;
@@ -133,7 +148,7 @@ impl MovingBuffer {
         }
 
         if read_range.end > buffered_range.end {
-            let got2 = inner_read_at(buffered_range.end, &mut buf[buflen - (read_range.end - buffered_range.end)..], self, read_at)?;
+            let got2 = inner_read_at(buffered_range.end, &mut buf[buflen - (read_range.end - buffered_range.end)..], self, read_at, write_at)?;
             got += got2;
         }
         Ok(got)
@@ -247,9 +262,9 @@ impl<T:Read+Seek+Write> Read for BufStream<T> {
             if inner.stream_position()? != pos as u64 {
                 inner.seek(SeekFrom::Start(pos as u64))?;
             }
-            println!("Reading from backing {} {}", pos, data.len());
+            //println!("Reading from backing {} {}", pos, data.len());
             let got = inner.read(data).unwrap();
-            println!("Read from backing {} {}", pos, data.len());
+            //println!("Read from backing {} {}", pos, data.len());
             Ok(got)
         },
         &mut |offset,data|{
@@ -258,9 +273,9 @@ impl<T:Read+Seek+Write> Read for BufStream<T> {
                 inner.seek(SeekFrom::Start(offset as u64))?;
             }
 
-            println!("Write back {} {}", offset, data.len());
+            //println!("Write back {} {}", offset, data.len());
             inner.write_all(data).unwrap();
-            println!("Written back {} {}", offset, data.len());
+            //println!("Written back {} {}", offset, data.len());
             Ok(())
         }
 
@@ -285,10 +300,12 @@ mod tests {
     impl Read for FakeStream {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             let mut to_read = buf.len();
+
             if to_read > 1 && self.short_read_by > 0 {
-                //to_read = (to_read-self.short_read_by).max(1);
+                to_read = (to_read-self.short_read_by).max(1);
             }
-            let end = (self.position+buf.len()).min(to_read);
+            let end = (self.position+to_read).min(self.buf.len());
+
             let got = end.saturating_sub(self.position);
             if got == 0 {
                 return Ok(0)
@@ -333,39 +350,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn it_works() {
-        for i in 0..10000000 {
-            fuzz(i, Some(3), Some(1));
-            fuzz(i, Some(1), Some(3));
-            fuzz(i, Some(10), Some(15));
-            fuzz(i, Some(15), Some(10));
-            fuzz(i, None, None);
-        }
-    }
-    #[test]
-    fn regression() {
-
-        fuzz(3, Some(16), Some(10));
-    }
 
     fn run_exhaustive_conf(
         bufsize: usize,
-        first_op: usize, first_op_param_options: usize,
-        second_op: usize, second_op_param_options: usize,
-        third_op: usize, third_op_param_options: usize,
+        ops: &[(usize,usize)],
         mut databyte: u8,
     ) {
         let mut good = FakeStream::default();
         let mut cut_inner = FakeStream::default();
 
         let mut cut = BufStream::with_capacity(cut_inner, bufsize);
-        use rand::SeedableRng;
-        for (op,param) in [
-            (first_op, first_op_param_options),
-            (second_op, second_op_param_options),
-            (third_op, third_op_param_options),
-        ] {
+
+        for (op,param) in ops.iter().copied() {
             match op {
                 0 if good.buf.len() > 0 => {
                     let seek_to = param;
@@ -374,15 +370,25 @@ mod tests {
                     cut.seek(SeekFrom::Start(seek_to as u64)).unwrap();
                 }
                 1  => {
-                    let read_bytes = param;
+                    let read_bytes = param/2;
+                    let short_read = param%2;
                     debug_println!("==READ {}",read_bytes);
+
                     let mut goodbuf = vec![0u8; read_bytes];
-                    good.read(&mut goodbuf).unwrap();
+                    good.short_read_by = short_read;
+                    let good_position = good.position;
+                    let goodgot = good.read(&mut goodbuf).unwrap();
+
+                    assert_eq!(goodgot +short_read, goodbuf.len().min(good.buf.len()-good_position));
 
                     let mut cutbuf = vec![0u8; read_bytes];
-                    cut.read(&mut cutbuf).unwrap();
+                    cut.inner.short_read_by = short_read;
+                    let cutgot = cut.read(&mut cutbuf).unwrap();
                     assert_eq!(goodbuf, cutbuf);
                     debug_println!("did READ {} -> {:?}", read_bytes, cutbuf);
+                    if cutgot != goodgot {
+                        good.position = cut.position;
+                    }
                 }
                 0|1|2 => {
                     let write_bytes = param;
@@ -392,8 +398,8 @@ mod tests {
                         databyte = databyte.wrapping_add(17);
                     }
                     debug_println!("==WRITE {} {:?}", buf.len(), buf);
-                    good.write(&buf).unwrap();
-                    cut.write(&buf).unwrap();
+                    let goodgot = good.write(&buf).unwrap();
+                    let cutgot = cut.write(&buf).unwrap();
                 }
                 _ => unreachable!()
             }
@@ -410,33 +416,76 @@ mod tests {
         let mut databyte = 0;
         for bufsize in [1,3,7] {
             for first_op in 0..3 {
-                let first_op_param_options = if first_op != 0 {4} else {1};
+                let first_op_param_options = if first_op != 0 {6} else {1};
                 for first_op_param in 0..first_op_param_options {
                     for second_op in 0..3 {
-                        let second_op_param_options = if first_op != 0 {4} else {1};
+                        let second_op_param_options = if second_op != 0 {6} else {1};
                         for third_op in 0..3 {
-                            let third_op_param_options = if first_op != 0 { 4 } else { 1 };
+                            let third_op_param_options = if third_op != 0 { 6 } else { 1 };
+                            for fourth_op in 0..3 {
+                                let fourth_op_param_options = if fourth_op != 0 { 6 } else { 1 };
 
-                            println!("Iteration {} {} {} {} {} {} {} {}",
-                                     bufsize,
-                                     first_op, first_op_param_options,
-                                     second_op, second_op_param_options,
-                                     third_op, third_op_param_options,
-                                     databyte
-                            );
-                            run_exhaustive_conf(
-                                bufsize,
-                                first_op, first_op_param_options,
-                                second_op, second_op_param_options,
-                                third_op, third_op_param_options,
-                                databyte
-                            );
-                            databyte += 1;
+                                println!("\n\n========Iteration {} {} {} {} {} {} {} {} {} {}===========",
+                                         bufsize,
+                                         first_op, first_op_param_options,
+                                         second_op, second_op_param_options,
+                                         third_op, third_op_param_options,
+                                         fourth_op, fourth_op_param_options,
+                                         databyte
+                                );
+                                run_exhaustive_conf(
+                                    bufsize,
+                                    &[
+                                    (first_op, first_op_param_options),
+                                    (second_op, second_op_param_options),
+                                    (third_op, third_op_param_options),
+                                    (fourth_op, fourth_op_param_options)
+                                ],
+                                    databyte
+                                );
+                                databyte = databyte.wrapping_add(1);
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn exhaustive_regress() {
+        let case = "7 2 6 1 6 0 1 1 6 13";
+
+        let mut items = case.split(" ").map(|x|x.parse::<usize>().unwrap());
+        let mut n = move||items.next().unwrap();
+
+        run_exhaustive_conf(
+            n(),
+            &[
+                (n(),  n()),
+                (n(),  n()),
+                (n(),  n()),
+                (n(),  n()),
+            ],
+            n() as u8
+        );
+    }
+
+    #[test]
+    fn fuzz_many() {
+        for i in 0..10000000 {
+            fuzz(i, Some(3), Some(1));
+            fuzz(i, Some(1), Some(3));
+            fuzz(i, Some(10), Some(15));
+            fuzz(i, Some(15), Some(10));
+            fuzz(i, None, None);
+        }
+    }
+
+    #[test]
+    fn regression() {
+
+        fuzz(0, Some(15), Some(10));
     }
 
     fn fuzz(seed: u64, buffer_size: Option<usize>, write_sizes: Option<usize>) {
@@ -447,7 +496,7 @@ mod tests {
         let mut cut_inner = FakeStream::default();
         let mut cut = BufStream::with_capacity(cut_inner, buffer_size);
         use rand::SeedableRng;
-        debug_println!("Seed: {}, buffer: {}, write size: {}", seed, buffer_size, write_sizes);
+        debug_println!("\n\n==== Seed: {}, buffer: {}, write size: {} ====", seed, buffer_size, write_sizes);
         for _ in 0..7 {
             match small_rng.gen_range(0..3) {
                 0 if good.buf.len() > 0=> {
@@ -458,14 +507,26 @@ mod tests {
                 }
                 1  => {
                     let read_bytes = small_rng.gen_range(0..write_sizes);
+                    let short_read = small_rng.gen_bool(0.3) as usize;
                     debug_println!("==READ {}",read_bytes);
                     let mut goodbuf = vec![0u8; read_bytes];
-                    good.read(&mut goodbuf).unwrap();
+                    good.short_read_by = short_read;
+                    let good_got = good.read(&mut goodbuf).unwrap();
+
+                    println!("Good read got {:?}", goodbuf);
 
                     let mut cutbuf = vec![0u8; read_bytes];
-                    cut.read(&mut cutbuf).unwrap();
-                    assert_eq!(goodbuf, cutbuf);
-                    debug_println!("did READ {} -> {:?}", read_bytes, cutbuf);
+                    cut.inner.short_read_by = short_read;
+                    let cut_got = cut.read(&mut cutbuf).unwrap();
+                    debug_println!("did READ {}/{} -> {:?} (short-read: {})", cut_got, read_bytes, cutbuf, short_read);
+                    if good_got > 0 {
+                        assert!(cut_got > 0);
+                    }
+                    let mingot = cut_got.min(good_got);
+                    if cut_got != good_got {
+                        good.position = cut.position;
+                    }
+                    assert_eq!(goodbuf[0..mingot], cutbuf[0..mingot]);
                 }
                 0|1|2 => {
                     let write_bytes = small_rng.gen_range(0..write_sizes);
@@ -477,6 +538,7 @@ mod tests {
                 }
                 _ => unreachable!()
             }
+            debug_println!("Good state: {:?}", good);
             debug_println!("Cut state: {:?}", cut);
             let mut cut_cloned = cut.clone();
             cut_cloned.flush().unwrap();
