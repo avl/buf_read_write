@@ -262,9 +262,7 @@ impl<T:Read+Seek+Write> Read for BufStream<T> {
             if inner.stream_position()? != pos as u64 {
                 inner.seek(SeekFrom::Start(pos as u64))?;
             }
-            //println!("Reading from backing {} {}", pos, data.len());
             let got = inner.read(data)?;
-            //println!("Read from backing {} {}", pos, data.len());
             Ok(got)
         },
         &mut |offset,data|{
@@ -273,9 +271,7 @@ impl<T:Read+Seek+Write> Read for BufStream<T> {
                 inner.seek(SeekFrom::Start(offset as u64))?;
             }
 
-            //println!("Write back {} {}", offset, data.len());
             inner.write_all(data)?;
-            //println!("Written back {} {}", offset, data.len());
             Ok(())
         }
 
