@@ -263,7 +263,7 @@ impl<T:Read+Seek+Write> Read for BufStream<T> {
                 inner.seek(SeekFrom::Start(pos as u64))?;
             }
             //println!("Reading from backing {} {}", pos, data.len());
-            let got = inner.read(data).unwrap();
+            let got = inner.read(data)?;
             //println!("Read from backing {} {}", pos, data.len());
             Ok(got)
         },
@@ -274,7 +274,7 @@ impl<T:Read+Seek+Write> Read for BufStream<T> {
             }
 
             //println!("Write back {} {}", offset, data.len());
-            inner.write_all(data).unwrap();
+            inner.write_all(data)?;
             //println!("Written back {} {}", offset, data.len());
             Ok(())
         }
