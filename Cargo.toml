@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.70"
 repository = "https://github.com/avl/buf_read_write"
 description = "Buffered IO. Like BufWriter and BufReader combined into one, with Seek-support."
-keywords = ["buffer", "io", "bufreader", "bufread", "buffered", "bufwrite", "bufwriter"]
+keywords = ["bufread", "io", "buffered", "bufwrite"]
 license = "MIT"
 
 [dependencies]
