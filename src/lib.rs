@@ -158,7 +158,11 @@ impl Drop for DropGuard<'_> {
 }
 
 fn union(range: &mut Range<usize>, rhs: Range<usize>) {
-    *range = range.start.min(rhs.start)..range.end.max(rhs.end);
+    if range.start == range.end {
+        *range = rhs;
+    } else {
+        *range = range.start.min(rhs.start)..range.end.max(rhs.end);
+    }
 }
 
 impl MovingBuffer {
@@ -175,7 +179,7 @@ impl MovingBuffer {
         &mut self,
         flusher: &mut impl FnMut(u64, &[u8]) -> Result<(), std::io::Error>,
     ) -> Result<(), std::io::Error> {
-        if !self.data.is_empty() && !self.dirty.is_empty() {
+        if !self.dirty.is_empty() {
             flusher(
                 self.offset + self.dirty.start as u64,
                 &self.data[self.dirty.clone()],
@@ -569,6 +573,20 @@ impl<T: Read + Seek + Write> BufStream<T> {
     }
 }
 
+
+#[inline(always)]
+/// We need to skip this in mutants testing. Both arms of the if-statement do exactly
+/// the same thing on machines where usize and u64 are the same size size.
+#[cfg_attr(test, mutants::skip)]
+fn increment_pos(position: &mut u64, buflen: usize) -> std::io::Result<()> {
+    if size_of::<usize>() > size_of::<u64>() {
+        *position += to_u64(buflen)?;
+    } else {
+        *position += buflen as u64;
+    }
+    Ok(())
+}
+
 impl<T: Read + Seek + Write> Read for BufStream<T> {
     #[inline]
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -580,11 +598,7 @@ impl<T: Read + Seek + Write> Read for BufStream<T> {
 
             buf.copy_from_slice(&self.buffer.data[offset..offset + buflen]);
 
-            if size_of::<usize>() > size_of::<u64>() {
-                self.position += to_u64(buflen)?;
-            } else {
-                self.position += buflen as u64;
-            }
+            increment_pos(&mut self.position, buflen)?;
 
             return Ok(buflen);
         }
@@ -850,6 +864,18 @@ mod tests {
     }
 
     #[test]
+    fn drop_implies_flush() {
+        let mut cut_inner = FakeStream::default();
+        let mut cut = BufStream::with_capacity(&mut cut_inner, 100);
+        cut.write(&[1, 2, 3]).unwrap();
+        // Not yet flushed
+        assert!(cut.inner.buf.is_empty());
+        drop(cut);
+        assert_eq!(cut_inner.buf, [1,2,3]);
+
+    }
+
+    #[test]
     fn can_seek_far_beyond_end() {
         let cut_inner = FakeStream::default();
         let mut cut = BufStream::with_capacity(cut_inner, 100);
@@ -920,6 +946,31 @@ mod tests {
         assert_eq!(cut.buffer.offset, 10); //This should have been flushed
     }
 
+    #[test]
+    fn big_read_followed_by_small_write_doesnt_write_everything() {
+        let mut cut_inner = FakeStream::default();
+        cut_inner.buf = vec![42u8;20];
+        let mut cut = BufStream::with_capacity(cut_inner, 20);
+
+        let mut buf = [0u8;20];
+        cut.read(&mut buf).unwrap();
+        assert_eq!(buf, [42u8;20]);
+
+        cut.seek(SeekFrom::Start(10)).unwrap();
+        cut.write(&[43]).unwrap();
+        cut.seek(SeekFrom::Start(12)).unwrap();
+        cut.write(&[43]).unwrap();
+
+        cut.inner.buf = vec![1u8;20];
+        cut.flush().unwrap();
+
+        assert_eq!(cut.inner.buf,
+            vec![1,1,1,1,1,  1,1,1,1,1,
+                 43,42,43,1,1,  1,1,1,1,1,
+                 ]
+        );
+
+    }
     #[test]
     fn reads_are_buffered() {
         let cut_inner = FakeStream::default();
@@ -1135,4 +1186,91 @@ mod tests {
             assert_eq!(&good.position, &(cut_cloned.position as usize));
         }
     }
+
+    /// A gigantic stream. All values read as position%256, and if written, must
+    /// be written to the same value.
+    #[derive(Default)]
+    struct SuperLargeStream {
+        position: u128,
+    }
+    impl Write for SuperLargeStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            for b in buf {
+                assert_eq!(*b, self.position as u8);
+                self.position += 1;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Read for SuperLargeStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            for b in buf.iter_mut() {
+                *b = self.position as u8;
+            }
+            Ok(buf.len())
+        }
+    }
+    impl Seek for SuperLargeStream {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            match pos {
+                SeekFrom::Start(p) => {
+                    self.position = p as u128;
+                }
+                SeekFrom::End(_e) => {
+                    panic!("SeekFrom::End not supported");
+                }
+                SeekFrom::Current(d) => {
+                    let new_position = self.position.checked_add_signed(d.into()).ok_or_else(
+                        || std::io::Error::new(std::io::ErrorKind::InvalidInput, "overflow")
+                    )?;
+                    if new_position > u64::MAX as u128 {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "overflow"));
+                    }
+                    self.position = new_position;
+                }
+            }
+            Ok(self.position.try_into().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "overflow"))?)
+        }
+    }
+
+
+    #[test]
+    fn test_extreme_size_handling() {
+
+        let large_backing = SuperLargeStream::default();
+        let mut large = BufStream::new(large_backing);
+
+        large.seek(SeekFrom::Start(u64::MAX)).unwrap(); // Should succeed
+
+        large.write(&[u64::MAX as u8]).unwrap_err();
+        large.seek(SeekFrom::Current(10)).unwrap_err();
+
+
+        let mut buf = [0u8; 1];
+        large.read(&mut buf).unwrap_err();
+
+        large.seek(SeekFrom::Start(256+2)).unwrap();
+        let mut buf = [0u8; 1];
+        large.read(&mut buf).unwrap();
+        assert_eq!(buf[0], 2);
+
+    }
+
+    #[test]
+    fn test_dirty_buffer_beyond_u64_max() {
+
+        let large_backing = SuperLargeStream::default();
+        let mut large = BufStream::new(large_backing);
+
+        large.seek(SeekFrom::Start(u64::MAX)).unwrap(); // Should succeed
+        large.read(&mut [0u8;1024]).unwrap_err();
+        large.write(&mut [255]).unwrap_err();
+        large.flush().unwrap();
+
+    }
+
 }
