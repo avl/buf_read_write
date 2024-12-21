@@ -1,6 +1,6 @@
 [package]
 name = "buf_read_write"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.70"
 repository = "https://github.com/avl/buf_read_write"
