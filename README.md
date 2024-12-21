@@ -23,7 +23,7 @@ to implement `std::io::Seek`.
  * No unsafe code
  * Extensive test suite
     * Custom random chaos testing
-    * Exhaustive testing of all 4 item sequences of operations read, write and seek with limited offsets.
+    * Exhaustive testing of all 4-item sequences of operations read, write and seek with limited offsets/sizes.
     * Cargo mutants testing
  * Performance overhead within 50% overhead of regular BufReader/BufWriter, for small reads/writes. 
  * Documented
