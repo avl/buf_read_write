@@ -55,6 +55,20 @@
 //!   writing beyond the end of this limit, even if no seeks occur. Because of how large 2^64
 //!   is, this is unlikely to be a problem in practice.
 //!
+//! * This crate does not panic itself, but the backing implementation may panic. Such panics
+//!   are handled gracefully. In general, the particular effect of any panicking operation is
+//!   that is may have completed to some arbitrary degree, but cannot have 'unexpected' effects.
+//!   I.e, panics do not uncover unsound behaviour in this library.
+//!
+//! * The underlying IO operations can fail. If this happens, naturally, IO may not be written
+//!   properly. Retrying [`Write::flush`] is supported, and if the backing implementation recovers,
+//!   so will BufStream. I.e, the internal state of BufStream is not corrupted by the backing
+//!   implementation failing or panicking.
+//!
+//! * This crate relies on unwinding for correctness. Unwinding is guaranteed by rust, so this
+//!   is not a limitation. Calling [`std::process::abort`] will lead to data loss, buffers will
+//!   not be flushed in this case.
+//!
 //! # Implementation
 //!
 //! * An extensive test suite exists, including automatic chaos testing, exhaustive testing
@@ -222,7 +236,7 @@ impl MovingBuffer {
                 self.offset = position;
                 union(
                     &mut self.dirty,
-                    self.data.len()..self.data.len() + data.len(),
+                    0..data.len(),
                 );
                 self.data.extend(data);
                 Ok(())
@@ -232,7 +246,57 @@ impl MovingBuffer {
             }
         }
     }
-
+    #[inline(always)]
+    fn write_zeroes_at(
+        &mut self,
+        position: u64,
+        zeroes: usize,
+        write_back: &mut impl FnMut(u64, &[u8]) -> Result<(), std::io::Error>,
+    ) -> Result<(), std::io::Error> {
+        // The following cannot overflow, because of how Vec works.
+        let free_capacity = self.data.capacity() - self.data.len();
+        if position == self.end()? && free_capacity >= zeroes {
+            union(
+                &mut self.dirty,
+                self.data.len()..self.data.len() + zeroes,
+            );
+            let oldlen = self.data.len();
+            debug_assert!(oldlen + zeroes <= self.data.capacity());
+            self.data.resize(oldlen + zeroes, 0);
+            Ok(())
+        } else if position >= self.offset && checked_add(position, zeroes)? <= self.end()? {
+            let relative_offset = to_usize(checked_sub_u64(position, self.offset)?)?;
+            let end = checked_add_usize(relative_offset, zeroes)?;
+            self.data[relative_offset..end].fill(0);
+            union(&mut self.dirty, relative_offset..end);
+            Ok(())
+        } else {
+            self.flush(write_back)?;
+            self.data.clear();
+            if zeroes < self.data.capacity() {
+                self.offset = position;
+                union(
+                    &mut self.dirty,
+                    0..zeroes,
+                );
+                let oldlen = self.data.len();
+                debug_assert!(oldlen + zeroes <= self.data.capacity());
+                self.data.resize(oldlen + zeroes, 0);
+                Ok(())
+            } else {
+                let zerobuf = [0u8;1024];
+                let mut to_write = zeroes;
+                let mut curpos = position;
+                while to_write > 0 {
+                    let write_now = to_write.min(zerobuf.len());
+                    write_back(curpos, &zerobuf[0..write_now])?;
+                    decrement_remaining(&mut to_write, write_now);
+                    curpos += write_now as u64;
+                }
+                Ok(())
+            }
+        }
+    }
     #[inline(always)]
     fn read_at<
         R: FnMut(u64, &mut [u8]) -> std::io::Result<usize>,
@@ -346,8 +410,16 @@ impl<T: Seek + Write> BufStream<T> {
     where
         T: Clone,
     {
+
+        let mut data = Vec::with_capacity(self.buffer.data.capacity());
+        data.extend_from_slice(&self.buffer.data);
+        let buffer = MovingBuffer {
+            offset: self.buffer.offset,
+            dirty: self.buffer.dirty.clone(),
+            data,
+        };
         BufStream {
-            buffer: self.buffer.clone(),
+            buffer,
             position: self.position,
             inner: self.inner.clone(),
             inner_position: self.inner_position,
@@ -401,9 +473,62 @@ impl<T: Read + Write + Seek + std::fmt::Debug> BufRead for BufStream<T> {
         self.position =
             checked_add(self.position, amt).expect("u64::MAX offset cannot be exceeded");
     }
+
 }
 
 impl<T: Write + Seek> BufStream<T> {
+
+    /// This method can be used to establish a window to update in a file.
+    ///
+    /// Semantically, it writes all-zeroes to the provided range.
+    ///
+    /// Additionally, it flushes any existing buffer, and establishes a new, non flushed, all-zero,
+    /// in-memory buffer covering the provided range.
+    ///
+    /// NOTE! If the provided range is larger than the buffer-capacity, this method does does a
+    /// flush, and an immediate seek + write of the given number of zeroes, without initializing
+    /// a new buffer.
+    pub fn write_zeroes(&mut self, len: usize) -> std::io::Result<()> {
+        let free_capacity = self.buffer.data.capacity() - self.buffer.data.len();
+        if self.position == self.buffer.offset + self.buffer.data.len() as u64
+            && free_capacity >= len
+            && self.buffer.dirty.end == self.buffer.data.len()
+        {
+            let oldlen = self.buffer.data.len();
+            debug_assert!(oldlen + len <= self.buffer.data.capacity());
+            self.buffer.data.resize(oldlen + len, 0);
+            self.buffer.dirty.end += len;
+            self.position = checked_add(self.position, len)?;
+            return Ok(());
+        }
+        self.write_zeroes_cold(len)?;
+        Ok(())
+    }
+    fn write_zeroes_cold(&mut self, len: usize) -> std::io::Result<()> {
+        self.buffer.write_zeroes_at(self.position, len, &mut |pos, data| {
+            if obtain_stream_position(&mut self.inner, &mut self.inner_position)? != pos {
+                self.inner_position = u64::MAX;
+                let t = self.inner.seek(SeekFrom::Start(pos));
+                t?;
+            }
+            self.inner_position = u64::MAX;
+            let t = self.inner.write_all(data);
+            t?;
+            self.inner_position = checked_add(pos, data.len())?;
+            Ok(())
+        })?;
+
+        self.position = self
+            .position
+            .checked_add(to_u64(len)?)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow")
+            })?;
+
+        Ok(())
+    }
+
+
     #[cold]
     #[inline(never)]
     fn write_cold(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -438,6 +563,7 @@ impl<T: Write + Seek> Write for BufStream<T> {
             && free_capacity >= buf.len()
             && self.buffer.dirty.end == self.buffer.data.len()
         {
+            debug_assert!(self.buffer.data.len()+buf.len() <= self.buffer.data.capacity());
             self.buffer.data.extend(buf);
             self.buffer.dirty.end += buf.len();
             self.position = checked_add(self.position, buf.len())?;
@@ -486,6 +612,9 @@ impl<T: Seek + Write> BufStream<T> {
     ///   The reason for this is that reading may require invalidating the buffer, which
     ///   may require flushing.
     pub fn with_capacity(inner: T, capacity: usize) -> Self {
+        if to_u64(capacity).is_err() {
+            panic!("Capacity cannot be larger than 2^64 -1 (u64::MAX)");
+        }
         Self {
             buffer: MovingBuffer::with_capacity(capacity),
             position: 0,
@@ -585,6 +714,17 @@ fn increment_pos(position: &mut u64, buflen: usize) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+
+
+#[inline(always)]
+/// We need to skip this in mutants testing, because not decreasing the 'remaining' value
+/// leads to infinite loops.
+#[cfg_attr(test, mutants::skip)]
+fn decrement_remaining(remaining: &mut usize, buflen: usize) {
+    *remaining -= buflen;
+}
+
 
 impl<T: Read + Seek + Write> Read for BufStream<T> {
     #[inline]
@@ -863,6 +1003,30 @@ mod tests {
     }
 
     #[test]
+    fn zero_writes_are_buffered() {
+        let cut_inner = FakeStream::default();
+        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        cut.write_zeroes(3).unwrap();
+        assert!(cut.inner.buf.is_empty());
+    }
+
+    #[test]
+    fn writes_are_buffered_even_with_small_buffer() {
+        let cut_inner = FakeStream::default();
+        let mut cut = BufStream::with_capacity(cut_inner, 3);
+        cut.write(&[1, 2, 3]).unwrap();
+        assert!(cut.inner.buf.is_empty());
+    }
+
+    #[test]
+    fn zero_writes_are_buffered_even_with_small_buffer() {
+        let cut_inner = FakeStream::default();
+        let mut cut = BufStream::with_capacity(cut_inner, 3);
+        cut.write_zeroes(3).unwrap();
+        assert!(cut.inner.buf.is_empty());
+    }
+
+    #[test]
     fn drop_implies_flush() {
         let mut cut_inner = FakeStream::default();
         let mut cut = BufStream::with_capacity(&mut cut_inner, 100);
@@ -893,6 +1057,34 @@ mod tests {
         cut.write(&[1, 2, 3]).unwrap();
         cut.flush().unwrap();
         assert_eq!(cut.inner.buf.len(), 6);
+    }
+
+    #[test]
+    fn can_write_zero_beyond_end() {
+        let cut_inner = FakeStream::default();
+        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        cut.write_zeroes(3).unwrap();
+        cut.flush().unwrap();
+        cut.seek(SeekFrom::Start(3)).unwrap();
+        cut.write_zeroes(3).unwrap();
+        cut.flush().unwrap();
+        assert_eq!(cut.inner.buf.len(), 6);
+    }
+
+    #[test]
+    fn write_large_number_of_zeroes() {
+        let mut cut_inner = FakeStream::default();
+        cut_inner.buf.resize(4000,42);
+        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        cut.seek(SeekFrom::Start(100)).unwrap();
+        cut.write_zeroes(4000).unwrap();
+        for x in cut.inner.buf.iter().take(100) {
+            assert_eq!(*x, 42);
+        }
+        for x in cut.inner.buf.iter().skip(100) {
+            assert_eq!(*x, 0);
+        }
+        assert_eq!(cut.inner.buf.len(), 4100);
     }
 
     #[test]
@@ -945,6 +1137,19 @@ mod tests {
     }
 
     #[test]
+    fn zero_writes_are_buffered_after_seek() {
+        let cut_inner = FakeStream::default();
+        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        cut.write_zeroes(3).unwrap();
+        cut.seek(SeekFrom::Start(10)).unwrap();
+        cut.write_zeroes(3).unwrap();
+        assert_eq!(cut.inner.buf, [0,0,0]); //This should have been flushed
+
+        assert_eq!(cut.buffer.data, [0,0,0]); //This should have been flushed
+        assert_eq!(cut.buffer.offset, 10); //This should have been flushed
+    }
+
+    #[test]
     fn big_read_followed_by_small_write_doesnt_write_everything() {
         let mut cut_inner = FakeStream::default();
         cut_inner.buf = vec![42u8; 20];
@@ -965,6 +1170,30 @@ mod tests {
         assert_eq!(
             cut.inner.buf,
             vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 43, 42, 43, 1, 1, 1, 1, 1, 1, 1,]
+        );
+    }
+
+    #[test]
+    fn big_read_followed_by_small_zero_write_doesnt_write_everything() {
+        let mut cut_inner = FakeStream::default();
+        cut_inner.buf = vec![42u8; 20];
+        let mut cut = BufStream::with_capacity(cut_inner, 20);
+
+        let mut buf = [0u8; 20];
+        cut.read(&mut buf).unwrap();
+        assert_eq!(buf, [42u8; 20]);
+
+        cut.seek(SeekFrom::Start(10)).unwrap();
+        cut.write_zeroes(1).unwrap();
+        cut.seek(SeekFrom::Start(12)).unwrap();
+        cut.write_zeroes(1).unwrap();
+
+        cut.inner.buf = vec![1u8; 20];
+        cut.flush().unwrap();
+
+        assert_eq!(
+            cut.inner.buf,
+            vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 42, 0, 1, 1, 1, 1, 1, 1, 1,]
         );
     }
     #[test]
@@ -1149,11 +1378,21 @@ mod tests {
                 0 | 2 => {
                     // Write
                     let write_bytes = small_rng.gen_range(0..write_sizes);
+                    let zero_instead = small_rng.gen_bool(0.25);
                     let mut buf = vec![0u8; write_bytes];
-                    small_rng.fill_bytes(&mut buf);
-                    debug_println!("==WRITE {} {:?} [{:?}]", buf.len(), buf, panic_or_err);
+                    if !zero_instead {
+                        small_rng.fill_bytes(&mut buf);
+                    }
+                    debug_println!("==WRITE {} {:?} [{:?}] zero: {:?}", buf.len(), buf, panic_or_err, zero_instead);
                     let good_got = catch(&mut || good.write(&buf));
-                    let cut_got = catch(&mut || cut.write(&buf));
+                    let cut_got = catch(&mut || {
+                        if zero_instead {
+                            cut.write_zeroes(buf.len())?;
+                            Ok(buf.len())
+                        } else {
+                            cut.write(&buf)
+                        }
+                    });
                     match (good_got, cut_got) {
                         (Ok(good_got), Ok(cut_got)) => {
                             assert_eq!(good_got, cut_got);
@@ -1176,10 +1415,12 @@ mod tests {
             good.repair();
             debug_println!("Good state: {:?}", good);
             debug_println!("Cut state: {:?}", cut);
+            assert_eq!(cut.buffer.data.capacity(), buffer_size);
             let mut cut_cloned = cut.clone();
             cut_cloned.flush().unwrap();
             assert_eq!(&good.buf, &cut_cloned.inner.buf);
             assert_eq!(&good.position, &(cut_cloned.position as usize));
+            assert_eq!(cut_cloned.buffer.data.capacity(), buffer_size);
         }
     }
 
