@@ -573,7 +573,6 @@ impl<T: Read + Seek + Write> BufStream<T> {
     }
 }
 
-
 #[inline(always)]
 /// We need to skip this in mutants testing. Both arms of the if-statement do exactly
 /// the same thing on machines where usize and u64 are the same size size.
@@ -871,8 +870,7 @@ mod tests {
         // Not yet flushed
         assert!(cut.inner.buf.is_empty());
         drop(cut);
-        assert_eq!(cut_inner.buf, [1,2,3]);
-
+        assert_eq!(cut_inner.buf, [1, 2, 3]);
     }
 
     #[test]
@@ -949,27 +947,25 @@ mod tests {
     #[test]
     fn big_read_followed_by_small_write_doesnt_write_everything() {
         let mut cut_inner = FakeStream::default();
-        cut_inner.buf = vec![42u8;20];
+        cut_inner.buf = vec![42u8; 20];
         let mut cut = BufStream::with_capacity(cut_inner, 20);
 
-        let mut buf = [0u8;20];
+        let mut buf = [0u8; 20];
         cut.read(&mut buf).unwrap();
-        assert_eq!(buf, [42u8;20]);
+        assert_eq!(buf, [42u8; 20]);
 
         cut.seek(SeekFrom::Start(10)).unwrap();
         cut.write(&[43]).unwrap();
         cut.seek(SeekFrom::Start(12)).unwrap();
         cut.write(&[43]).unwrap();
 
-        cut.inner.buf = vec![1u8;20];
+        cut.inner.buf = vec![1u8; 20];
         cut.flush().unwrap();
 
-        assert_eq!(cut.inner.buf,
-            vec![1,1,1,1,1,  1,1,1,1,1,
-                 43,42,43,1,1,  1,1,1,1,1,
-                 ]
+        assert_eq!(
+            cut.inner.buf,
+            vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 43, 42, 43, 1, 1, 1, 1, 1, 1, 1,]
         );
-
     }
     #[test]
     fn reads_are_buffered() {
@@ -1224,23 +1220,28 @@ mod tests {
                     panic!("SeekFrom::End not supported");
                 }
                 SeekFrom::Current(d) => {
-                    let new_position = self.position.checked_add_signed(d.into()).ok_or_else(
-                        || std::io::Error::new(std::io::ErrorKind::InvalidInput, "overflow")
-                    )?;
+                    let new_position =
+                        self.position.checked_add_signed(d.into()).ok_or_else(|| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidInput, "overflow")
+                        })?;
                     if new_position > u64::MAX as u128 {
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "overflow"));
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "overflow",
+                        ));
                     }
                     self.position = new_position;
                 }
             }
-            Ok(self.position.try_into().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "overflow"))?)
+            Ok(self
+                .position
+                .try_into()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "overflow"))?)
         }
     }
 
-
     #[test]
     fn test_extreme_size_handling() {
-
         let large_backing = SuperLargeStream::default();
         let mut large = BufStream::new(large_backing);
 
@@ -1249,28 +1250,23 @@ mod tests {
         large.write(&[u64::MAX as u8]).unwrap_err();
         large.seek(SeekFrom::Current(10)).unwrap_err();
 
-
         let mut buf = [0u8; 1];
         large.read(&mut buf).unwrap_err();
 
-        large.seek(SeekFrom::Start(256+2)).unwrap();
+        large.seek(SeekFrom::Start(256 + 2)).unwrap();
         let mut buf = [0u8; 1];
         large.read(&mut buf).unwrap();
         assert_eq!(buf[0], 2);
-
     }
 
     #[test]
     fn test_dirty_buffer_beyond_u64_max() {
-
         let large_backing = SuperLargeStream::default();
         let mut large = BufStream::new(large_backing);
 
         large.seek(SeekFrom::Start(u64::MAX)).unwrap(); // Should succeed
-        large.read(&mut [0u8;1024]).unwrap_err();
+        large.read(&mut [0u8; 1024]).unwrap_err();
         large.write(&mut [255]).unwrap_err();
         large.flush().unwrap();
-
     }
-
 }
