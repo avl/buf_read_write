@@ -578,7 +578,7 @@ impl<T: Read + Seek + Write> BufStream<T> {
 /// the same thing on machines where usize and u64 are the same size size.
 #[cfg_attr(test, mutants::skip)]
 fn increment_pos(position: &mut u64, buflen: usize) -> std::io::Result<()> {
-    if size_of::<usize>() > size_of::<u64>() {
+    if std::mem::size_of::<usize>() > std::mem::size_of::<u64>() {
         *position += to_u64(buflen)?;
     } else {
         *position += buflen as u64;
