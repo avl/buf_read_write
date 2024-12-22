@@ -1,1 +1,1 @@
-cargo mutants -- --release  $@
+cargo mutants -- --release --all-features  $@

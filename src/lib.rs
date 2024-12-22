@@ -92,6 +92,7 @@
 extern crate core;
 
 use std::cell::RefCell;
+use std::fs::File;
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::mem::forget;
 use std::ops::Range;
@@ -109,7 +110,7 @@ struct MovingBuffer {
 #[cfg(debug_assertions)]
 macro_rules! debug_println {
     ($f:expr, $($a:expr),+) => {{
-        // Enable this if you need to debug
+        //Enable this if you need to debug
         //println!($f, $($a),+ );
     }};
 }
@@ -138,6 +139,7 @@ fn checked_add(position: u64, size: usize) -> std::io::Result<u64> {
         })?)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))
 }
+
 #[inline(always)]
 fn checked_add_usize(position: usize, size: usize) -> std::io::Result<usize> {
     position
@@ -393,6 +395,19 @@ where
     position: u64,
     inner_position: u64,
     inner: T,
+
+    /// Incremented on each write call to the backing implementation
+    #[cfg(feature="instrument")]
+    pub count_write_calls: usize,
+    /// Incremented on each read call to the backing implementation
+    #[cfg(feature="instrument")]
+    pub count_read_calls: usize,
+    /// Incremented on each seek call to the backing implementation
+    #[cfg(feature="instrument")]
+    pub count_seek_calls: usize,
+    /// Incremented on each flush call to the backing implementation
+    #[cfg(feature="instrument")]
+    pub count_flush_calls: usize,
 }
 
 impl<T: Seek + Write> BufStream<T> {
@@ -413,21 +428,27 @@ impl<T: Seek + Write> BufStream<T> {
             position: self.position,
             inner: self.inner.clone(),
             inner_position: self.inner_position,
+            #[cfg(feature="instrument")]
+            count_write_calls: self.count_write_calls,
+            #[cfg(feature="instrument")]
+            count_read_calls: self.count_read_calls,
+            #[cfg(feature="instrument")]
+            count_seek_calls: self.count_seek_calls,
+            #[cfg(feature="instrument")]
+            count_flush_calls: self.count_flush_calls,
         }
     }
 }
 
 #[inline]
-fn obtain_stream_position<T: Seek>(
-    inner: &mut T,
-    inner_position: &mut u64,
-) -> std::io::Result<u64> {
-    if *inner_position != u64::MAX {
-        debug_assert_eq!(*inner_position, inner.stream_position()?);
-        return Ok(*inner_position);
+fn check_stream_position(
+    inner_position: u64,
+    expected_position: u64
+) -> bool {
+    if inner_position != u64::MAX && inner_position == expected_position {
+        return true;
     }
-    *inner_position = inner.stream_position()?;
-    Ok(*inner_position)
+    false
 }
 
 impl<T: Read + Write + Seek + std::fmt::Debug> BufRead for BufStream<T> {
@@ -446,12 +467,19 @@ impl<T: Read + Write + Seek + std::fmt::Debug> BufRead for BufStream<T> {
         debug_assert!(!self.buffer.data.is_empty());
         let dropguard = DropGuard(&mut self.buffer.data);
 
-        if obtain_stream_position(&mut self.inner, &mut self.inner_position)? != self.position {
+        if !check_stream_position(self.inner_position,
+                                 self.position
+        ) {
             self.inner_position = u64::MAX;
+            #[cfg(feature="instrument")]
+            {self.count_seek_calls += 1;}
             self.inner.seek(SeekFrom::Start(self.position))?;
+
         }
         self.inner_position = u64::MAX;
 
+        #[cfg(feature="instrument")]
+        {self.count_read_calls += 1;}
         let got = self.inner.read(dropguard.0)?;
         dropguard.0.truncate(got);
         self.inner_position = checked_add(self.position, got)?;
@@ -465,7 +493,10 @@ impl<T: Read + Write + Seek + std::fmt::Debug> BufRead for BufStream<T> {
     }
 }
 
+
 impl<T: Write + Seek> BufStream<T> {
+
+
     /// This method can be used to establish a window to update in a file.
     ///
     /// Semantically, it writes all-zeroes to the provided range.
@@ -495,12 +526,16 @@ impl<T: Write + Seek> BufStream<T> {
     fn write_zeroes_cold(&mut self, len: usize) -> std::io::Result<()> {
         self.buffer
             .write_zeroes_at(self.position, len, &mut |pos, data| {
-                if obtain_stream_position(&mut self.inner, &mut self.inner_position)? != pos {
+                if !check_stream_position(self.inner_position, pos) {
                     self.inner_position = u64::MAX;
+                    #[cfg(feature="instrument")]
+                    {self.count_seek_calls += 1;}
                     let t = self.inner.seek(SeekFrom::Start(pos));
                     t?;
                 }
                 self.inner_position = u64::MAX;
+                #[cfg(feature="instrument")]
+                {self.count_write_calls += 1;}
                 let t = self.inner.write_all(data);
                 t?;
                 self.inner_position = checked_add(pos, data.len())?;
@@ -518,12 +553,16 @@ impl<T: Write + Seek> BufStream<T> {
     #[inline(never)]
     fn write_cold(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.buffer.write_at(self.position, buf, &mut |pos, data| {
-            if obtain_stream_position(&mut self.inner, &mut self.inner_position)? != pos {
+            if !check_stream_position( self.inner_position, pos) {
                 self.inner_position = u64::MAX;
+                #[cfg(feature="instrument")]
+                {self.count_seek_calls += 1;}
                 let t = self.inner.seek(SeekFrom::Start(pos));
                 t?;
             }
             self.inner_position = u64::MAX;
+            #[cfg(feature="instrument")]
+            {self.count_write_calls += 1;}
             let t = self.inner.write_all(data);
             t?;
             self.inner_position = checked_add(pos, data.len())?;
@@ -559,9 +598,20 @@ impl<T: Write + Seek> Write for BufStream<T> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.flush_write()?;
+        #[cfg(feature="instrument")]
+        {self.count_flush_calls += 1;}
         self.inner.flush()
     }
 }
+
+impl BufStream<File> {
+    /// Flush the buffer, then call the underlying [`File::sync_all`].
+    pub fn sync_all(&mut self) -> std::io::Result<()> {
+        self.flush()?;
+        self.inner.sync_all()
+    }
+}
+
 
 impl<T: Write + Seek> Drop for BufStream<T> {
     fn drop(&mut self) {
@@ -572,12 +622,16 @@ impl<T: Write + Seek> Drop for BufStream<T> {
 impl<T: Write + Seek> BufStream<T> {
     fn flush_write(&mut self) -> Result<(), std::io::Error> {
         let t = self.buffer.flush(&mut |offset, data| {
-            if offset != obtain_stream_position(&mut self.inner, &mut self.inner_position)? {
+            if !check_stream_position( self.inner_position, offset) {
                 self.inner_position = u64::MAX;
+                #[cfg(feature="instrument")]
+                {self.count_seek_calls += 1;}
                 self.inner.seek(SeekFrom::Start(offset))?;
             }
             self.inner_position = u64::MAX;
 
+            #[cfg(feature="instrument")]
+            {self.count_write_calls += 1;}
             self.inner.write_all(data)?;
             self.inner_position = checked_add(offset, data.len())?;
             Ok(())
@@ -588,6 +642,18 @@ impl<T: Write + Seek> BufStream<T> {
 }
 
 impl<T: Seek + Write> BufStream<T> {
+
+
+    /// Return a text-representation of the instrumentation metrics
+    #[cfg(feature="instrument")]
+    #[cfg_attr(test, mutants::skip)]
+    pub fn instrumentation(&self) -> String {
+        format!("BufStream(reads={}, writes={}, seeks={}, flushes={}",
+            self.count_read_calls, self.count_write_calls, self.count_seek_calls,
+            self.count_flush_calls
+        )
+    }
+
     /// Crate a new instance, wrapping `inner`, with the given buffer size.
     ///
     /// Note:
@@ -605,6 +671,15 @@ impl<T: Seek + Write> BufStream<T> {
             position: 0,
             inner_position: u64::MAX,
             inner,
+
+            #[cfg(feature="instrument")]
+            count_write_calls: 0,
+            #[cfg(feature="instrument")]
+            count_read_calls: 0,
+            #[cfg(feature="instrument")]
+            count_seek_calls: 0,
+            #[cfg(feature="instrument")]
+            count_flush_calls: 0,
         }
     }
 
@@ -629,6 +704,8 @@ impl<T: Write + Seek> Seek for BufStream<T> {
             }
             SeekFrom::End(e) => {
                 self.flush_write()?;
+                #[cfg(feature="instrument")]
+                {self.count_seek_calls += 1;}
                 let pos = self.inner.seek(SeekFrom::End(e))?;
                 self.inner_position = pos;
                 self.position = pos;
@@ -643,11 +720,66 @@ impl<T: Write + Seek> Seek for BufStream<T> {
     }
 }
 impl<T: Read + Seek + Write> BufStream<T> {
+
+
+    /// Call the given closure with 'count' bytes of from the file at the curren position.
+    ///
+    /// If possible, this request will be satisfied from bytes within the buffer.
+    /// If that's not possible, this method will flush the buffer and read from the
+    /// underlying storage. Note, this method will then allocate additional storage enough
+    /// to hold the given range.
+    ///
+    /// If the read goes beyond the end of file, the buffer will be shorter than `count`.
+    pub fn with_bytes<R>(&mut self, count: usize, mut f: impl FnMut(&[u8]) -> R) -> std::io::Result<R> {
+        let u64count = to_u64(count)?;
+        if self.position >= self.buffer.offset && self.position+u64count <= self.buffer.offset+ to_u64(self.buffer.data.len())? {
+            //Fits in buffer
+            let ret = f(&self.buffer.data[
+                to_usize(self.position-self.buffer.offset)?..
+                    to_usize(self.position+u64count-self.buffer.offset)?
+                ]);
+            self.position = checked_add(self.position, count)?;
+            Ok(ret)
+        } else {
+            self.flush_write()?;
+
+            let mut temp = vec![0u8;count];
+            if !check_stream_position( self.inner_position, self.position) {
+                self.inner_position = u64::MAX;
+                #[cfg(feature="instrument")]
+                {self.count_seek_calls += 1;}
+                self.inner.seek(SeekFrom::Start(self.position))?;
+            }
+            self.inner_position = u64::MAX;
+            let mut curoff = 0;
+            loop {
+                #[cfg(feature="instrument")]
+                {self.count_read_calls += 1;}
+                let got = self.inner.read(&mut temp[curoff..])?;
+                curoff += got;
+                if got == 0 {
+                    temp.truncate(curoff);
+                    break;
+                }
+                if curoff == count {
+                    break;
+                }
+            }
+            self.position = checked_add(self.position, curoff)?;
+            self.inner_position = self.position;
+            Ok(f(&temp))
+        }
+    }
+
     #[cold]
     #[inline(never)]
     fn read_cold(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let inner = RefCell::new(&mut self.inner);
         let inner_position = RefCell::new(&mut self.inner_position);
+
+        #[cfg(feature="instrument")]
+        let seek_calls = RefCell::new(&mut self.count_seek_calls);
+
         let got = self.buffer.read_at(
             self.position,
             buf,
@@ -656,11 +788,15 @@ impl<T: Read + Seek + Write> BufStream<T> {
 
                 let mut inner_position = inner_position.borrow_mut();
 
-                if obtain_stream_position(&mut *inner, *inner_position)? != pos {
+                if !check_stream_position(**inner_position, pos) {
                     **inner_position = u64::MAX;
+                    #[cfg(feature="instrument")]
+                    {**seek_calls.borrow_mut() += 1;}
                     inner.seek(SeekFrom::Start(pos))?;
                 }
                 **inner_position = u64::MAX;
+                #[cfg(feature="instrument")]
+                {self.count_read_calls += 1;}
                 let got = inner.read(data)?;
                 **inner_position = checked_add(pos, got)?;
                 debug_assert!(got <= data.len());
@@ -669,12 +805,16 @@ impl<T: Read + Seek + Write> BufStream<T> {
             &mut |offset, data| {
                 let mut inner_position = inner_position.borrow_mut();
                 let mut inner = inner.borrow_mut();
-                if offset != obtain_stream_position(&mut *inner, *inner_position)? {
+                if !check_stream_position(**inner_position, offset) {
                     **inner_position = u64::MAX;
+                    #[cfg(feature="instrument")]
+                    {**seek_calls.borrow_mut() += 1;}
                     inner.seek(SeekFrom::Start(offset))?;
                 }
                 **inner_position = u64::MAX;
 
+                #[cfg(feature="instrument")]
+                {self.count_write_calls += 1;}
                 inner.write_all(data)?;
 
                 **inner_position = checked_add(offset, data.len())?;
@@ -744,6 +884,11 @@ mod tests {
         panic_after: usize,
         err_after: usize,
         writes_have_occurred: bool,
+
+        seek_calls: usize,
+        write_calls: usize,
+        read_calls: usize,
+        flush_calls: usize,
     }
     impl FakeStream {
         fn repair(&mut self) {
@@ -769,6 +914,7 @@ mod tests {
     }
     impl Read for FakeStream {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.read_calls += 1;
             self.maybe_panic()?;
 
             let mut to_read = buf.len();
@@ -789,6 +935,7 @@ mod tests {
     }
     impl Write for FakeStream {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.write_calls += 1;
             self.writes_have_occurred = true;
             self.maybe_panic()?;
             for b in buf {
@@ -804,12 +951,14 @@ mod tests {
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_calls += 1;
             self.maybe_panic()?;
             Ok(())
         }
     }
     impl Seek for FakeStream {
         fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.seek_calls += 1;
             self.maybe_panic()?;
             match pos {
                 SeekFrom::Start(s) => {
@@ -973,7 +1122,7 @@ mod tests {
 
     #[test]
     fn regression() {
-        fuzz(0, Some(15), Some(10), false);
+        fuzz(63, Some(4), Some(3), true);
     }
 
     #[test]
@@ -1101,8 +1250,8 @@ mod tests {
         let mut cut = BufStream::with_capacity(cut_inner, 100);
         cut.write(&[1]).unwrap();
         cut.inner_position = u64::MAX;
-        let pos = obtain_stream_position(&mut cut.inner, &mut cut.inner_position).unwrap();
-        assert_eq!(pos, cut.inner.stream_position().unwrap());
+        let pos = check_stream_position(cut.inner_position, cut.position);
+        assert!(!pos);
     }
 
     #[test]
@@ -1178,6 +1327,7 @@ mod tests {
             vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 42, 0, 1, 1, 1, 1, 1, 1, 1,]
         );
     }
+
     #[test]
     fn reads_are_buffered() {
         let cut_inner = FakeStream::default();
@@ -1252,10 +1402,11 @@ mod tests {
         let mut cut = BufStream::with_capacity(cut_inner, buffer_size);
         use rand::SeedableRng;
         debug_println!(
-            "\n\n==== Seed: {}, buffer: {}, write size: {} ====",
+            "\n\n==== Seed: {}, buffer: {}, write size: {} bufread: {:?} ====",
             seed,
             buffer_size,
-            write_sizes
+            write_sizes,
+            bufread
         );
         for _ in 0..7 {
             let mut panic_or_err = false;
@@ -1297,25 +1448,35 @@ mod tests {
                     //Read
                     let read_bytes = small_rng.gen_range(0..write_sizes);
                     let short_read = small_rng.gen_bool(0.3) as usize;
-                    debug_println!("==READ {} [{:?}]", read_bytes, panic_or_err);
                     let mut goodbuf = vec![0u8; read_bytes];
                     good.short_read_by = short_read;
                     let good_got = catch(&mut || good.read(&mut goodbuf));
 
                     let mut cutbuf = vec![0u8; read_bytes];
                     cut.inner.short_read_by = short_read;
+                    debug_println!("==READ {} [{:?}] {:?}", read_bytes, panic_or_err, bufread);
 
                     let cut_got;
                     if bufread {
-                        cut_got = catch(&mut || {
-                            let cutbuflen = cutbuf.len();
-                            let fillbuf = cut.fill_buf()?;
-                            let data = &fillbuf[0..cutbuflen.min(fillbuf.len())];
-                            cutbuf[0..data.len()].copy_from_slice(data);
-                            let len = data.len();
-                            cut.consume(len);
-                            Ok(len)
-                        });
+                        if small_rng.gen_bool(0.5) {
+                            cut_got = catch(&mut || {
+                                let len = cut.with_bytes(read_bytes, |idata|{
+                                    cutbuf[0..idata.len()].copy_from_slice(idata);
+                                    idata.len()
+                                })?;
+                                Ok(len)
+                            });
+                        } else  {
+                            cut_got = catch(&mut || {
+                                let cutbuflen = cutbuf.len();
+                                let fillbuf = cut.fill_buf()?;
+                                let data = &fillbuf[0..cutbuflen.min(fillbuf.len())];
+                                cutbuf[0..data.len()].copy_from_slice(data);
+                                let len = data.len();
+                                cut.consume(len);
+                                Ok(len)
+                            });
+                        }
                     } else {
                         cut_got = catch(&mut || cut.read(&mut cutbuf));
                     }
@@ -1404,10 +1565,20 @@ mod tests {
             debug_println!("Good state: {:?}", good);
             debug_println!("Cut state: {:?}", cut);
             assert_eq!(cut.buffer.data.capacity(), buffer_size);
+
+            #[cfg(feature="instrument")]
+            {
+                assert_eq!(cut.inner.write_calls, cut.count_write_calls, "write count");
+                assert_eq!(cut.inner.read_calls, cut.count_read_calls, "read count");
+                assert_eq!(cut.inner.seek_calls, cut.count_seek_calls, "seek count");
+                assert_eq!(cut.inner.flush_calls, cut.count_flush_calls, "flush count");
+            }
             let mut cut_cloned = cut.clone();
             cut_cloned.flush().unwrap();
             assert_eq!(&good.buf, &cut_cloned.inner.buf);
             assert_eq!(&good.position, &(cut_cloned.position as usize));
+
+
             assert_eq!(cut_cloned.buffer.data.capacity(), buffer_size);
         }
     }
