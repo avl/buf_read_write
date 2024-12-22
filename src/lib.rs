@@ -1803,7 +1803,7 @@ mod tests {
             cut.write(&[43;32]).unwrap();
 
             cut.seek(SeekFrom::Start(end)).unwrap();
-            cut.flush_if(700).unwrap();
+            cut.flush_if(700, true).unwrap();
         }
 
         assert_eq!(cut.count_seek_calls, 1);
@@ -1821,7 +1821,19 @@ mod tests {
         {
             assert_eq!(cut.count_read_calls, 100);
         }
+    }
 
+    #[test]
+    fn repeated_short_reads_are_handled_with_bytes() {
+        let mut cut_inner = FakeStream::default();
+        cut_inner.buf.resize(100,42);
+        cut_inner.short_read_by = 1000;
+        let mut cut = BufStream::with_capacity(cut_inner, 1000).unwrap();
+        cut.with_bytes(100,|_|{}).unwrap();
+        #[cfg(feature="instrument")]
+        {
+            assert_eq!(cut.count_read_calls, 100);
+        }
     }
 
 
