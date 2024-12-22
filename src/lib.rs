@@ -38,7 +38,9 @@
 //!
 //! * Buffered reads assume the file is being traversed forward. Reading position 2000
 //!   with a buffer size of 1000, will result in a call to the backing implementation of
-//!   bytes `2000..3000`.
+//!   bytes `2000..3000`. Reading 1000 bytes at position 2000, then immediately after reading
+//!   1000 bytes at position 1999, will result in two reads of 1000 bytes. Note, the results
+//!   will still be correct for any seek pattern, it's just that forward operation is faster.
 //!
 //! * All writes behave like [`std::io::Write::write_all`]. This simplifies the implementation,
 //!   and is often what you want for disk io (the main use case for this library).
@@ -111,7 +113,7 @@ struct MovingBuffer {
 macro_rules! debug_println {
     ($f:expr, $($a:expr),+) => {{
         //Enable this if you need to debug
-        //println!($f, $($a),+ );
+        println!($f, $($a),+ );
     }};
 }
 
@@ -166,10 +168,10 @@ fn to_u64(value: usize) -> std::io::Result<u64> {
         .map_err(|_err| std::io::Error::new(std::io::ErrorKind::InvalidData, "Arithmetic overflow"))
 }
 
-struct DropGuard<'a>(&'a mut Vec<u8>);
+struct DropGuard<'a>(&'a mut Vec<u8>, usize);
 impl Drop for DropGuard<'_> {
     fn drop(&mut self) {
-        self.0.clear();
+        self.0.truncate(self.1);
     }
 }
 
@@ -328,7 +330,7 @@ impl MovingBuffer {
             tself.data.resize(cap, 0);
             tself.offset = position;
 
-            let dropguard = DropGuard(&mut tself.data);
+            let dropguard = DropGuard(&mut tself.data, 0);
             let got = read_at(position, dropguard.0)?;
             dropguard.0.truncate(got);
             forget(dropguard);
@@ -340,22 +342,46 @@ impl MovingBuffer {
         let read_range = position..checked_add(position, buf.len())?;
         let buffered_range = self.offset..self.end()?;
 
-        let buflen = buf.len();
+        //let buflen = buf.len();
 
         if read_range.end <= buffered_range.start {
             return inner_read_at(read_range.start, buf, self, read_at, write_at);
         }
-        if read_range.start >= buffered_range.end {
+        if read_range.start > buffered_range.end {
             return inner_read_at(read_range.start, buf, self, read_at, write_at);
+        }
+
+        if read_range.start >= buffered_range.start && read_range.start <= buffered_range.end && read_range.end > buffered_range.end{
+
+            let complementary_bytes = to_usize(read_range.end - buffered_range.end)?;
+            if self.data.len() + complementary_bytes > self.data.capacity() {
+                return inner_read_at(read_range.start, buf, self, read_at, write_at);
+            } else {
+                let start = self.data.len();
+                let dropguard = DropGuard(&mut self.data, start);
+                let newsize = start + complementary_bytes;
+                dropguard.0.resize(newsize, 0);
+                let got = read_at(self.offset + start as u64, &mut dropguard.0[start..])?;
+                dropguard.0.truncate(start + got);
+                forget(dropguard);
+
+                let buffered_range = self.offset..self.offset+self.data.len() as u64;
+                let satisfaction = if read_range.end <= buffered_range.end {
+                    read_range.end - read_range.start
+                } else {
+                    buffered_range.end - read_range.start
+                } as usize;
+                let read_offset = (read_range.start-buffered_range.start) as usize;
+                buf[0..satisfaction].copy_from_slice(self.data[read_offset..read_offset+satisfaction].as_ref());
+                debug_assert!(self.dirty.end <= self.data.len());
+
+                return Ok(satisfaction);
+            }
         }
 
         let mut got = 0;
         if read_range.start < buffered_range.start {
-            let len = to_usize(buffered_range.start - read_range.start)?.min(buflen);
-            got = read_at(read_range.start, &mut buf[0..len])?;
-            if got < len {
-                return Ok(got);
-            }
+            return inner_read_at(read_range.start, buf, self, read_at, write_at);
         }
 
         if let Some(overlap) = overlap(read_range.clone(), buffered_range.clone()) {
@@ -366,7 +392,8 @@ impl MovingBuffer {
             got = checked_add_usize(got, overlapping_src_slice.len())?;
         }
 
-        if read_range.end > buffered_range.end {
+        debug_assert!(read_range.end <= buffered_range.end);
+        /*if read_range.end > buffered_range.end {
             let got2 = inner_read_at(
                 buffered_range.end,
                 &mut buf[buflen - to_usize(read_range.end - buffered_range.end)?..],
@@ -375,7 +402,7 @@ impl MovingBuffer {
                 write_at,
             )?;
             got = checked_add_usize(got, got2)?;
-        }
+        }*/
         Ok(got)
     }
 }
@@ -465,7 +492,7 @@ impl<T: Read + Write + Seek + std::fmt::Debug> BufRead for BufStream<T> {
         self.buffer.data.resize(cap, 0);
         self.buffer.offset = self.position;
         debug_assert!(!self.buffer.data.is_empty());
-        let dropguard = DropGuard(&mut self.buffer.data);
+        let dropguard = DropGuard(&mut self.buffer.data, 0);
 
         if !check_stream_position(self.inner_position,
                                  self.position
@@ -606,6 +633,7 @@ impl<T: Write + Seek> Write for BufStream<T> {
 
 impl BufStream<File> {
     /// Flush the buffer, then call the underlying [`File::sync_all`].
+    #[cfg_attr(test, mutants::skip)] // Very hard to test, sync_all is only needed in special cases
     pub fn sync_all(&mut self) -> std::io::Result<()> {
         self.flush()?;
         self.inner.sync_all()
@@ -649,9 +677,38 @@ impl<T: Seek + Write> BufStream<T> {
     #[cfg_attr(test, mutants::skip)]
     pub fn instrumentation(&self) -> String {
         format!("BufStream(reads={}, writes={}, seeks={}, flushes={}",
-            self.count_read_calls, self.count_write_calls, self.count_seek_calls,
-            self.count_flush_calls
+                self.count_read_calls, self.count_write_calls, self.count_seek_calls,
+                self.count_flush_calls
         )
+    }
+
+    /// This drops any buffered data, without writing it to the backing implementation.
+    ///
+    /// WARNING! This leads to data-loss. Mostly only usable for troubleshooting and very
+    /// special requirements.
+    #[cfg_attr(test, mutants::skip)]
+    pub fn drop_buffer(&mut self) {
+        self.buffer.data.clear();
+        self.buffer.dirty = 0..0;
+    }
+
+    /// Conditionally flush the buffer.
+    ///
+    /// A flush is performed if this BufStream has more than 'buffer_size' bytes
+    /// buffered for writing.
+    ///
+    /// The `flush_inner` parameter decides if a flush-call is emitted to the
+    /// backing implementation.
+    #[cfg_attr(test, mutants::skip)]
+    pub fn flush_if(&mut self, buffer_size: usize, flush_inner: bool,) -> std::io::Result<()> {
+        if self.buffer.data.len() >= buffer_size {
+            if flush_inner {
+                self.flush()?;
+            } else {
+                self.flush_write()?;
+            }
+        }
+        Ok(())
     }
 
     /// Crate a new instance, wrapping `inner`, with the given buffer size.
@@ -662,14 +719,15 @@ impl<T: Seek + Write> BufStream<T> {
     /// * To be able to read, `inner` must implement [`Read`], [`Write`] and [`Seek`].
     ///   The reason for this is that reading may require invalidating the buffer, which
     ///   may require flushing.
-    pub fn with_capacity(inner: T, capacity: usize) -> Self {
+    pub fn with_capacity(mut inner: T, capacity: usize) -> std::io::Result<Self> {
         if to_u64(capacity).is_err() {
             panic!("Capacity cannot be larger than 2^64 -1 (u64::MAX)");
         }
-        Self {
+        let pos = inner.stream_position()?;
+        Ok(Self {
             buffer: MovingBuffer::with_capacity(capacity),
-            position: 0,
-            inner_position: u64::MAX,
+            position: pos,
+            inner_position: pos,
             inner,
 
             #[cfg(feature="instrument")]
@@ -677,10 +735,10 @@ impl<T: Seek + Write> BufStream<T> {
             #[cfg(feature="instrument")]
             count_read_calls: 0,
             #[cfg(feature="instrument")]
-            count_seek_calls: 0,
+            count_seek_calls: 1,
             #[cfg(feature="instrument")]
             count_flush_calls: 0,
-        }
+        })
     }
 
     /// Crate a new instance, wrapping `inner`, with a default buffer size.
@@ -691,7 +749,7 @@ impl<T: Seek + Write> BufStream<T> {
     /// * To be able to read, `inner` must implement [`Read`], [`Write`] and [`Seek`].
     ///   The reason for this is that reading may require invalidating the buffer, which
     ///   may require flushing.
-    pub fn new(inner: T) -> Self {
+    pub fn new(inner: T) -> std::io::Result<Self> {
         Self::with_capacity(inner, DEFAULT_BUF_SIZE)
     }
 }
@@ -719,6 +777,13 @@ impl<T: Write + Seek> Seek for BufStream<T> {
         Ok(self.position)
     }
 }
+
+#[inline(always)]
+#[cfg_attr(test, mutants::skip)]
+fn is_zero(value: usize) -> bool {
+    value == 0
+}
+
 impl<T: Read + Seek + Write> BufStream<T> {
 
 
@@ -756,8 +821,8 @@ impl<T: Read + Seek + Write> BufStream<T> {
                 #[cfg(feature="instrument")]
                 {self.count_read_calls += 1;}
                 let got = self.inner.read(&mut temp[curoff..])?;
-                curoff += got;
-                if got == 0 {
+                increment_pos_usize(&mut curoff,  got);
+                if is_zero(got) {
                     temp.truncate(curoff);
                     break;
                 }
@@ -839,7 +904,13 @@ fn increment_pos(position: &mut u64, buflen: usize) -> std::io::Result<()> {
     }
     Ok(())
 }
-
+#[inline(always)]
+/// We need to skip this in mutants testing, because this is used in for loops
+/// to make progress, causing them to never complete otherwise.
+#[cfg_attr(test, mutants::skip)]
+fn increment_pos_usize(position: &mut usize, buflen: usize){
+    *position += buflen;
+}
 #[inline(always)]
 /// We need to skip this in mutants testing, because not decreasing the 'remaining' value
 /// leads to infinite loops.
@@ -920,12 +991,12 @@ mod tests {
             let mut to_read = buf.len();
 
             if to_read > 1 && self.short_read_by > 0 {
-                to_read = (to_read - self.short_read_by).max(1);
+                to_read = (to_read.saturating_sub(self.short_read_by)).max(1);
             }
             let end = (self.position + to_read).min(self.buf.len());
 
             let got = end.saturating_sub(self.position);
-            if got == 0 {
+            if is_zero(got) {
                 return Ok(0);
             }
             buf[0..got].copy_from_slice(&self.buf[self.position..self.position + got]);
@@ -979,7 +1050,7 @@ mod tests {
         let mut good = FakeStream::default();
         let cut_inner = FakeStream::default();
 
-        let mut cut = BufStream::with_capacity(cut_inner, bufsize);
+        let mut cut = BufStream::with_capacity(cut_inner, bufsize).unwrap();
 
         for (op, param) in ops.iter().copied() {
             match op {
@@ -1122,13 +1193,13 @@ mod tests {
 
     #[test]
     fn regression() {
-        fuzz(63, Some(4), Some(3), true);
+        fuzz(8, Some(15), Some(10), false);
     }
 
     #[test]
     fn writes_are_buffered() {
         let cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        let mut cut = BufStream::with_capacity(cut_inner, 100).unwrap();
         cut.write(&[1, 2, 3]).unwrap();
         assert!(cut.inner.buf.is_empty());
     }
@@ -1136,15 +1207,29 @@ mod tests {
     #[test]
     fn zero_writes_are_buffered() {
         let cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        let mut cut = BufStream::with_capacity(cut_inner, 100).unwrap();
         cut.write_zeroes(3).unwrap();
         assert!(cut.inner.buf.is_empty());
     }
 
     #[test]
+    #[cfg(feature = "instrument")]
+    fn seeks_are_counted() {
+        let mut cut_inner = FakeStream::default();
+        cut_inner.buf = vec![1,2,3];
+        let mut cut = BufStream::with_capacity(cut_inner, 100).unwrap();
+
+        cut.seek(SeekFrom::Start(0)).unwrap();
+        cut.seek(SeekFrom::Current(0)).unwrap();
+        cut.seek(SeekFrom::End(1)).unwrap();
+
+        assert_eq!(cut.count_seek_calls, 2, "only the SeekFrom::End should go through tot the underlying object, and then there's the initial seek");
+    }
+
+    #[test]
     fn writes_are_buffered_even_with_small_buffer() {
         let cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(cut_inner, 3);
+        let mut cut = BufStream::with_capacity(cut_inner, 3).unwrap();
         cut.write(&[1, 2, 3]).unwrap();
         assert!(cut.inner.buf.is_empty());
     }
@@ -1152,7 +1237,7 @@ mod tests {
     #[test]
     fn zero_writes_are_buffered_even_with_small_buffer() {
         let cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(cut_inner, 3);
+        let mut cut = BufStream::with_capacity(cut_inner, 3).unwrap();
         cut.write_zeroes(3).unwrap();
         assert!(cut.inner.buf.is_empty());
     }
@@ -1160,7 +1245,7 @@ mod tests {
     #[test]
     fn drop_implies_flush() {
         let mut cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(&mut cut_inner, 100);
+        let mut cut = BufStream::with_capacity(&mut cut_inner, 100).unwrap();
         cut.write(&[1, 2, 3]).unwrap();
         // Not yet flushed
         assert!(cut.inner.buf.is_empty());
@@ -1171,7 +1256,7 @@ mod tests {
     #[test]
     fn can_seek_far_beyond_end() {
         let cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        let mut cut = BufStream::with_capacity(cut_inner, 100).unwrap();
         cut.seek(SeekFrom::Start(200)).unwrap();
         cut.write(&[1, 2, 3]).unwrap();
         cut.flush().unwrap();
@@ -1181,7 +1266,7 @@ mod tests {
     #[test]
     fn can_write_beyond_end() {
         let cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        let mut cut = BufStream::with_capacity(cut_inner, 100).unwrap();
         cut.write(&[1, 2, 3]).unwrap();
         cut.flush().unwrap();
         cut.seek(SeekFrom::Start(3)).unwrap();
@@ -1193,7 +1278,7 @@ mod tests {
     #[test]
     fn can_write_zero_beyond_end() {
         let cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        let mut cut = BufStream::with_capacity(cut_inner, 100).unwrap();
         cut.write_zeroes(3).unwrap();
         cut.flush().unwrap();
         cut.seek(SeekFrom::Start(3)).unwrap();
@@ -1206,7 +1291,7 @@ mod tests {
     fn write_large_number_of_zeroes() {
         let mut cut_inner = FakeStream::default();
         cut_inner.buf.resize(4000, 42);
-        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        let mut cut = BufStream::with_capacity(cut_inner, 100).unwrap();
         cut.seek(SeekFrom::Start(100)).unwrap();
         cut.write_zeroes(4000).unwrap();
         for x in cut.inner.buf.iter().take(100) {
@@ -1223,7 +1308,7 @@ mod tests {
         let mut cut_inner = FakeStream::default();
         cut_inner.write(&[1, 2, 3, 4, 5]).unwrap();
         cut_inner.writes_have_occurred = false;
-        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        let mut cut = BufStream::with_capacity(cut_inner, 100).unwrap();
         cut.seek(SeekFrom::Start(1)).unwrap();
         let mut buf = [0, 0, 0];
         cut.read(&mut buf).unwrap();
@@ -1235,7 +1320,7 @@ mod tests {
     #[test]
     fn can_seek_and_write_just_beyond_end() {
         let cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        let mut cut = BufStream::with_capacity(cut_inner, 100).unwrap();
         cut.write(&[1, 2, 3]).unwrap();
         cut.flush().unwrap();
         cut.seek(SeekFrom::Start(4)).unwrap();
@@ -1247,17 +1332,38 @@ mod tests {
     #[test]
     fn stream_position_is_reloaded() {
         let cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        let mut cut = BufStream::with_capacity(cut_inner, 100).unwrap();
         cut.write(&[1]).unwrap();
         cut.inner_position = u64::MAX;
         let pos = check_stream_position(cut.inner_position, cut.position);
         assert!(!pos);
     }
+    #[test]
+    fn stream_position_logic() {
+        assert_eq!(
+            check_stream_position(1,1),
+            true);
+        assert_eq!(
+            check_stream_position(2,1),
+            false);
+        assert_eq!(
+            check_stream_position(1,u64::MAX),
+            false);
+        assert_eq!(
+            check_stream_position(u64::MAX,u64::MAX),
+            false);
+        assert_eq!(
+            check_stream_position(u64::MAX,u64::MAX-1),
+            false);
+        assert_eq!(
+            check_stream_position(u64::MAX-1,u64::MAX-1),
+            true);
+    }
 
     #[test]
     fn writes_are_buffered_after_seek() {
         let cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        let mut cut = BufStream::with_capacity(cut_inner, 100).unwrap();
         cut.write(&[1, 2, 3]).unwrap();
         cut.seek(SeekFrom::Start(10)).unwrap();
         cut.write(&[4, 5, 6]).unwrap();
@@ -1270,7 +1376,7 @@ mod tests {
     #[test]
     fn zero_writes_are_buffered_after_seek() {
         let cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        let mut cut = BufStream::with_capacity(cut_inner, 100).unwrap();
         cut.write_zeroes(3).unwrap();
         cut.seek(SeekFrom::Start(10)).unwrap();
         cut.write_zeroes(3).unwrap();
@@ -1284,7 +1390,7 @@ mod tests {
     fn big_read_followed_by_small_write_doesnt_write_everything() {
         let mut cut_inner = FakeStream::default();
         cut_inner.buf = vec![42u8; 20];
-        let mut cut = BufStream::with_capacity(cut_inner, 20);
+        let mut cut = BufStream::with_capacity(cut_inner, 20).unwrap();
 
         let mut buf = [0u8; 20];
         cut.read(&mut buf).unwrap();
@@ -1308,7 +1414,7 @@ mod tests {
     fn big_read_followed_by_small_zero_write_doesnt_write_everything() {
         let mut cut_inner = FakeStream::default();
         cut_inner.buf = vec![42u8; 20];
-        let mut cut = BufStream::with_capacity(cut_inner, 20);
+        let mut cut = BufStream::with_capacity(cut_inner, 20).unwrap();
 
         let mut buf = [0u8; 20];
         cut.read(&mut buf).unwrap();
@@ -1331,7 +1437,7 @@ mod tests {
     #[test]
     fn reads_are_buffered() {
         let cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(cut_inner, 100);
+        let mut cut = BufStream::with_capacity(cut_inner, 100).unwrap();
         cut.write(&[1, 2, 3, 4, 5]).unwrap();
         cut.seek(SeekFrom::Start(0)).unwrap();
         let mut temp = [0, 0, 0];
@@ -1350,7 +1456,7 @@ mod tests {
     #[test]
     fn seek_plus_read_will_still_use_buffer() {
         let cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(cut_inner, 3);
+        let mut cut = BufStream::with_capacity(cut_inner, 3).unwrap();
         cut.write(&[1, 2, 3, 4, 5, 7, 8, 9, 10]).unwrap();
 
         cut.seek(SeekFrom::Start(7)).unwrap();
@@ -1399,7 +1505,7 @@ mod tests {
         let write_sizes = write_sizes.unwrap_or(small_rng.gen_range(1..10));
         let mut good = FakeStream::default();
         let cut_inner = FakeStream::default();
-        let mut cut = BufStream::with_capacity(cut_inner, buffer_size);
+        let mut cut = BufStream::with_capacity(cut_inner, buffer_size).unwrap();
         use rand::SeedableRng;
         debug_println!(
             "\n\n==== Seed: {}, buffer: {}, write size: {} bufread: {:?} ====",
@@ -1643,7 +1749,7 @@ mod tests {
     #[test]
     fn test_extreme_size_handling() {
         let large_backing = SuperLargeStream::default();
-        let mut large = BufStream::new(large_backing);
+        let mut large = BufStream::new(large_backing).unwrap();
 
         large.seek(SeekFrom::Start(u64::MAX)).unwrap(); // Should succeed
 
@@ -1662,11 +1768,62 @@ mod tests {
     #[test]
     fn test_dirty_buffer_beyond_u64_max() {
         let large_backing = SuperLargeStream::default();
-        let mut large = BufStream::new(large_backing);
+        let mut large = BufStream::new(large_backing).unwrap();
 
         large.seek(SeekFrom::Start(u64::MAX)).unwrap(); // Should succeed
         large.read(&mut [0u8; 1024]).unwrap_err();
         large.write(&mut [255]).unwrap_err();
         large.flush().unwrap();
     }
+
+    #[test]
+    #[cfg(feature="instrument")]
+    fn instrument_counts_flushes() {
+        let cut_inner = FakeStream::default();
+        let mut cut = BufStream::new(cut_inner).unwrap();
+        for i in 1..6 {
+            cut.flush().unwrap();
+            assert_eq!(cut.count_flush_calls, i);
+        }
+    }
+
+    #[test]
+    #[cfg(feature="instrument")]
+    fn test_buffer_seek_only_when_needed() {
+        let cut_inner = FakeStream::default();
+        let mut cut = BufStream::with_capacity(cut_inner, 1000).unwrap();
+
+        for _ in 0..3000 {
+            let pos = cut.stream_position().unwrap();
+            cut.write_zeroes(32).unwrap();
+
+            cut.write(&[42u8;200]).unwrap();
+            let end = cut.stream_position().unwrap();
+            cut.seek(SeekFrom::Start(pos)).unwrap();
+            cut.write(&[43;32]).unwrap();
+
+            cut.seek(SeekFrom::Start(end)).unwrap();
+            cut.flush_if(700).unwrap();
+        }
+
+        assert_eq!(cut.count_seek_calls, 1);
+    }
+
+    #[test]
+    fn repeated_short_reads_are_handled() {
+        let mut cut_inner = FakeStream::default();
+        cut_inner.buf.resize(100,42);
+        cut_inner.short_read_by = 1000;
+        let mut cut = BufStream::with_capacity(cut_inner, 1000).unwrap();
+        let mut buf = [0u8;100];
+        cut.read_exact(&mut buf).unwrap();
+        #[cfg(feature="instrument")]
+        {
+            assert_eq!(cut.count_read_calls, 100);
+        }
+
+    }
+
+
+
 }

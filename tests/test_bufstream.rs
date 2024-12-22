@@ -7,7 +7,7 @@ use std::sync::Arc;
 fn test_bufstream() {
     let my_data = vec![1, 2, 3, 4, 5];
 
-    let mut stream = BufStream::new(Cursor::new(my_data));
+    let mut stream = BufStream::new(Cursor::new(my_data)).unwrap();
 
     stream.seek(SeekFrom::Start(1)).unwrap();
     stream.write_all(&[42]).unwrap();
@@ -22,7 +22,7 @@ fn test_bufstream() {
 fn test_seeks() {
     let my_data = vec![0, 1, 2, 3, 4];
 
-    let mut stream = BufStream::new(Cursor::new(my_data));
+    let mut stream = BufStream::new(Cursor::new(my_data)).unwrap();
 
     stream.seek(SeekFrom::Start(1)).unwrap();
     let mut buf = [0];
@@ -91,7 +91,7 @@ impl Seek for InstrumentedCursor {
 fn test_writes_are_buffered() {
     let writer = InstrumentedCursor::default();
     let instrumentation = writer.instrumentation.clone();
-    let mut bufstream = BufStream::new(writer);
+    let mut bufstream = BufStream::new(writer).unwrap();
 
     for i in 0..100 {
         bufstream.write_all(&[i]).unwrap();
@@ -104,20 +104,21 @@ fn test_writes_are_buffered() {
 fn test_seeks_are_virtualized() {
     let writer = InstrumentedCursor::default();
     let instrumentation = writer.instrumentation.clone();
-    let mut bufstream = BufStream::new(writer);
+    let mut bufstream = BufStream::new(writer).unwrap();
 
     for i in 0..100 {
         bufstream.seek(SeekFrom::Start(i)).unwrap();
     }
-    assert_eq!(instrumentation.seeks.load(Ordering::Relaxed), 0);
+    // We always do an initial seek to determine the initial offset
+    assert_eq!(instrumentation.seeks.load(Ordering::Relaxed), 1);
     bufstream.flush().unwrap();
-    assert_eq!(instrumentation.seeks.load(Ordering::Relaxed), 0);
+    assert_eq!(instrumentation.seeks.load(Ordering::Relaxed), 1);
 }
 #[test]
 fn test_reads_are_buffered() {
     let cursor = InstrumentedCursor::default();
     let instrumentation = cursor.instrumentation.clone();
-    let mut bufstream = BufStream::new(cursor);
+    let mut bufstream = BufStream::new(cursor).unwrap();
 
     for i in 0..100 {
         bufstream.write_all(&[i]).unwrap();
