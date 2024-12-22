@@ -351,8 +351,10 @@ impl MovingBuffer {
             return inner_read_at(read_range.start, buf, self, read_at, write_at);
         }
 
-        if read_range.start >= buffered_range.start && read_range.start <= buffered_range.end && read_range.end > buffered_range.end{
-
+        if read_range.start >= buffered_range.start
+            && read_range.start <= buffered_range.end
+            && read_range.end > buffered_range.end
+        {
             let complementary_bytes = to_usize(read_range.end - buffered_range.end)?;
             if self.data.len() + complementary_bytes > self.data.capacity() {
                 return inner_read_at(read_range.start, buf, self, read_at, write_at);
@@ -365,14 +367,15 @@ impl MovingBuffer {
                 dropguard.0.truncate(start + got);
                 forget(dropguard);
 
-                let buffered_range = self.offset..self.offset+self.data.len() as u64;
+                let buffered_range = self.offset..self.offset + self.data.len() as u64;
                 let satisfaction = if read_range.end <= buffered_range.end {
                     read_range.end - read_range.start
                 } else {
                     buffered_range.end - read_range.start
                 } as usize;
-                let read_offset = (read_range.start-buffered_range.start) as usize;
-                buf[0..satisfaction].copy_from_slice(self.data[read_offset..read_offset+satisfaction].as_ref());
+                let read_offset = (read_range.start - buffered_range.start) as usize;
+                buf[0..satisfaction]
+                    .copy_from_slice(self.data[read_offset..read_offset + satisfaction].as_ref());
                 debug_assert!(self.dirty.end <= self.data.len());
 
                 return Ok(satisfaction);
@@ -424,16 +427,16 @@ where
     inner: T,
 
     /// Incremented on each write call to the backing implementation
-    #[cfg(feature="instrument")]
+    #[cfg(feature = "instrument")]
     pub count_write_calls: usize,
     /// Incremented on each read call to the backing implementation
-    #[cfg(feature="instrument")]
+    #[cfg(feature = "instrument")]
     pub count_read_calls: usize,
     /// Incremented on each seek call to the backing implementation
-    #[cfg(feature="instrument")]
+    #[cfg(feature = "instrument")]
     pub count_seek_calls: usize,
     /// Incremented on each flush call to the backing implementation
-    #[cfg(feature="instrument")]
+    #[cfg(feature = "instrument")]
     pub count_flush_calls: usize,
 }
 
@@ -455,23 +458,20 @@ impl<T: Seek + Write> BufStream<T> {
             position: self.position,
             inner: self.inner.clone(),
             inner_position: self.inner_position,
-            #[cfg(feature="instrument")]
+            #[cfg(feature = "instrument")]
             count_write_calls: self.count_write_calls,
-            #[cfg(feature="instrument")]
+            #[cfg(feature = "instrument")]
             count_read_calls: self.count_read_calls,
-            #[cfg(feature="instrument")]
+            #[cfg(feature = "instrument")]
             count_seek_calls: self.count_seek_calls,
-            #[cfg(feature="instrument")]
+            #[cfg(feature = "instrument")]
             count_flush_calls: self.count_flush_calls,
         }
     }
 }
 
 #[inline]
-fn check_stream_position(
-    inner_position: u64,
-    expected_position: u64
-) -> bool {
+fn check_stream_position(inner_position: u64, expected_position: u64) -> bool {
     if inner_position != u64::MAX && inner_position == expected_position {
         return true;
     }
@@ -494,19 +494,20 @@ impl<T: Read + Write + Seek + std::fmt::Debug> BufRead for BufStream<T> {
         debug_assert!(!self.buffer.data.is_empty());
         let dropguard = DropGuard(&mut self.buffer.data, 0);
 
-        if !check_stream_position(self.inner_position,
-                                 self.position
-        ) {
+        if !check_stream_position(self.inner_position, self.position) {
             self.inner_position = u64::MAX;
-            #[cfg(feature="instrument")]
-            {self.count_seek_calls += 1;}
+            #[cfg(feature = "instrument")]
+            {
+                self.count_seek_calls += 1;
+            }
             self.inner.seek(SeekFrom::Start(self.position))?;
-
         }
         self.inner_position = u64::MAX;
 
-        #[cfg(feature="instrument")]
-        {self.count_read_calls += 1;}
+        #[cfg(feature = "instrument")]
+        {
+            self.count_read_calls += 1;
+        }
         let got = self.inner.read(dropguard.0)?;
         dropguard.0.truncate(got);
         self.inner_position = checked_add(self.position, got)?;
@@ -520,10 +521,7 @@ impl<T: Read + Write + Seek + std::fmt::Debug> BufRead for BufStream<T> {
     }
 }
 
-
 impl<T: Write + Seek> BufStream<T> {
-
-
     /// This method can be used to establish a window to update in a file.
     ///
     /// Semantically, it writes all-zeroes to the provided range.
@@ -555,14 +553,18 @@ impl<T: Write + Seek> BufStream<T> {
             .write_zeroes_at(self.position, len, &mut |pos, data| {
                 if !check_stream_position(self.inner_position, pos) {
                     self.inner_position = u64::MAX;
-                    #[cfg(feature="instrument")]
-                    {self.count_seek_calls += 1;}
+                    #[cfg(feature = "instrument")]
+                    {
+                        self.count_seek_calls += 1;
+                    }
                     let t = self.inner.seek(SeekFrom::Start(pos));
                     t?;
                 }
                 self.inner_position = u64::MAX;
-                #[cfg(feature="instrument")]
-                {self.count_write_calls += 1;}
+                #[cfg(feature = "instrument")]
+                {
+                    self.count_write_calls += 1;
+                }
                 let t = self.inner.write_all(data);
                 t?;
                 self.inner_position = checked_add(pos, data.len())?;
@@ -580,16 +582,20 @@ impl<T: Write + Seek> BufStream<T> {
     #[inline(never)]
     fn write_cold(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.buffer.write_at(self.position, buf, &mut |pos, data| {
-            if !check_stream_position( self.inner_position, pos) {
+            if !check_stream_position(self.inner_position, pos) {
                 self.inner_position = u64::MAX;
-                #[cfg(feature="instrument")]
-                {self.count_seek_calls += 1;}
+                #[cfg(feature = "instrument")]
+                {
+                    self.count_seek_calls += 1;
+                }
                 let t = self.inner.seek(SeekFrom::Start(pos));
                 t?;
             }
             self.inner_position = u64::MAX;
-            #[cfg(feature="instrument")]
-            {self.count_write_calls += 1;}
+            #[cfg(feature = "instrument")]
+            {
+                self.count_write_calls += 1;
+            }
             let t = self.inner.write_all(data);
             t?;
             self.inner_position = checked_add(pos, data.len())?;
@@ -625,8 +631,10 @@ impl<T: Write + Seek> Write for BufStream<T> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.flush_write()?;
-        #[cfg(feature="instrument")]
-        {self.count_flush_calls += 1;}
+        #[cfg(feature = "instrument")]
+        {
+            self.count_flush_calls += 1;
+        }
         self.inner.flush()
     }
 }
@@ -640,7 +648,6 @@ impl BufStream<File> {
     }
 }
 
-
 impl<T: Write + Seek> Drop for BufStream<T> {
     fn drop(&mut self) {
         _ = self.flush_write();
@@ -650,16 +657,20 @@ impl<T: Write + Seek> Drop for BufStream<T> {
 impl<T: Write + Seek> BufStream<T> {
     fn flush_write(&mut self) -> Result<(), std::io::Error> {
         let t = self.buffer.flush(&mut |offset, data| {
-            if !check_stream_position( self.inner_position, offset) {
+            if !check_stream_position(self.inner_position, offset) {
                 self.inner_position = u64::MAX;
-                #[cfg(feature="instrument")]
-                {self.count_seek_calls += 1;}
+                #[cfg(feature = "instrument")]
+                {
+                    self.count_seek_calls += 1;
+                }
                 self.inner.seek(SeekFrom::Start(offset))?;
             }
             self.inner_position = u64::MAX;
 
-            #[cfg(feature="instrument")]
-            {self.count_write_calls += 1;}
+            #[cfg(feature = "instrument")]
+            {
+                self.count_write_calls += 1;
+            }
             self.inner.write_all(data)?;
             self.inner_position = checked_add(offset, data.len())?;
             Ok(())
@@ -670,15 +681,16 @@ impl<T: Write + Seek> BufStream<T> {
 }
 
 impl<T: Seek + Write> BufStream<T> {
-
-
     /// Return a text-representation of the instrumentation metrics
-    #[cfg(feature="instrument")]
+    #[cfg(feature = "instrument")]
     #[cfg_attr(test, mutants::skip)]
     pub fn instrumentation(&self) -> String {
-        format!("BufStream(reads={}, writes={}, seeks={}, flushes={}",
-                self.count_read_calls, self.count_write_calls, self.count_seek_calls,
-                self.count_flush_calls
+        format!(
+            "BufStream(reads={}, writes={}, seeks={}, flushes={}",
+            self.count_read_calls,
+            self.count_write_calls,
+            self.count_seek_calls,
+            self.count_flush_calls
         )
     }
 
@@ -700,7 +712,7 @@ impl<T: Seek + Write> BufStream<T> {
     /// The `flush_inner` parameter decides if a flush-call is emitted to the
     /// backing implementation.
     #[cfg_attr(test, mutants::skip)]
-    pub fn flush_if(&mut self, buffer_size: usize, flush_inner: bool,) -> std::io::Result<()> {
+    pub fn flush_if(&mut self, buffer_size: usize, flush_inner: bool) -> std::io::Result<()> {
         if self.buffer.data.len() >= buffer_size {
             if flush_inner {
                 self.flush()?;
@@ -730,13 +742,13 @@ impl<T: Seek + Write> BufStream<T> {
             inner_position: pos,
             inner,
 
-            #[cfg(feature="instrument")]
+            #[cfg(feature = "instrument")]
             count_write_calls: 0,
-            #[cfg(feature="instrument")]
+            #[cfg(feature = "instrument")]
             count_read_calls: 0,
-            #[cfg(feature="instrument")]
+            #[cfg(feature = "instrument")]
             count_seek_calls: 1,
-            #[cfg(feature="instrument")]
+            #[cfg(feature = "instrument")]
             count_flush_calls: 0,
         })
     }
@@ -762,8 +774,10 @@ impl<T: Write + Seek> Seek for BufStream<T> {
             }
             SeekFrom::End(e) => {
                 self.flush_write()?;
-                #[cfg(feature="instrument")]
-                {self.count_seek_calls += 1;}
+                #[cfg(feature = "instrument")]
+                {
+                    self.count_seek_calls += 1;
+                }
                 let pos = self.inner.seek(SeekFrom::End(e))?;
                 self.inner_position = pos;
                 self.position = pos;
@@ -785,8 +799,6 @@ fn is_zero(value: usize) -> bool {
 }
 
 impl<T: Read + Seek + Write> BufStream<T> {
-
-
     /// Call the given closure with 'count' bytes of from the file at the curren position.
     ///
     /// If possible, this request will be satisfied from bytes within the buffer.
@@ -795,33 +807,43 @@ impl<T: Read + Seek + Write> BufStream<T> {
     /// to hold the given range.
     ///
     /// If the read goes beyond the end of file, the buffer will be shorter than `count`.
-    pub fn with_bytes<R>(&mut self, count: usize, mut f: impl FnMut(&[u8]) -> R) -> std::io::Result<R> {
+    pub fn with_bytes<R>(
+        &mut self,
+        count: usize,
+        mut f: impl FnMut(&[u8]) -> R,
+    ) -> std::io::Result<R> {
         let u64count = to_u64(count)?;
-        if self.position >= self.buffer.offset && self.position+u64count <= self.buffer.offset+ to_u64(self.buffer.data.len())? {
+        if self.position >= self.buffer.offset
+            && self.position + u64count <= self.buffer.offset + to_u64(self.buffer.data.len())?
+        {
             //Fits in buffer
-            let ret = f(&self.buffer.data[
-                to_usize(self.position-self.buffer.offset)?..
-                    to_usize(self.position+u64count-self.buffer.offset)?
-                ]);
+            let ret = f(
+                &self.buffer.data[to_usize(self.position - self.buffer.offset)?
+                    ..to_usize(self.position + u64count - self.buffer.offset)?],
+            );
             self.position = checked_add(self.position, count)?;
             Ok(ret)
         } else {
             self.flush_write()?;
 
-            let mut temp = vec![0u8;count];
-            if !check_stream_position( self.inner_position, self.position) {
+            let mut temp = vec![0u8; count];
+            if !check_stream_position(self.inner_position, self.position) {
                 self.inner_position = u64::MAX;
-                #[cfg(feature="instrument")]
-                {self.count_seek_calls += 1;}
+                #[cfg(feature = "instrument")]
+                {
+                    self.count_seek_calls += 1;
+                }
                 self.inner.seek(SeekFrom::Start(self.position))?;
             }
             self.inner_position = u64::MAX;
             let mut curoff = 0;
             loop {
-                #[cfg(feature="instrument")]
-                {self.count_read_calls += 1;}
+                #[cfg(feature = "instrument")]
+                {
+                    self.count_read_calls += 1;
+                }
                 let got = self.inner.read(&mut temp[curoff..])?;
-                increment_pos_usize(&mut curoff,  got);
+                increment_pos_usize(&mut curoff, got);
                 if is_zero(got) {
                     temp.truncate(curoff);
                     break;
@@ -842,7 +864,7 @@ impl<T: Read + Seek + Write> BufStream<T> {
         let inner = RefCell::new(&mut self.inner);
         let inner_position = RefCell::new(&mut self.inner_position);
 
-        #[cfg(feature="instrument")]
+        #[cfg(feature = "instrument")]
         let seek_calls = RefCell::new(&mut self.count_seek_calls);
 
         let got = self.buffer.read_at(
@@ -855,13 +877,17 @@ impl<T: Read + Seek + Write> BufStream<T> {
 
                 if !check_stream_position(**inner_position, pos) {
                     **inner_position = u64::MAX;
-                    #[cfg(feature="instrument")]
-                    {**seek_calls.borrow_mut() += 1;}
+                    #[cfg(feature = "instrument")]
+                    {
+                        **seek_calls.borrow_mut() += 1;
+                    }
                     inner.seek(SeekFrom::Start(pos))?;
                 }
                 **inner_position = u64::MAX;
-                #[cfg(feature="instrument")]
-                {self.count_read_calls += 1;}
+                #[cfg(feature = "instrument")]
+                {
+                    self.count_read_calls += 1;
+                }
                 let got = inner.read(data)?;
                 **inner_position = checked_add(pos, got)?;
                 debug_assert!(got <= data.len());
@@ -872,14 +898,18 @@ impl<T: Read + Seek + Write> BufStream<T> {
                 let mut inner = inner.borrow_mut();
                 if !check_stream_position(**inner_position, offset) {
                     **inner_position = u64::MAX;
-                    #[cfg(feature="instrument")]
-                    {**seek_calls.borrow_mut() += 1;}
+                    #[cfg(feature = "instrument")]
+                    {
+                        **seek_calls.borrow_mut() += 1;
+                    }
                     inner.seek(SeekFrom::Start(offset))?;
                 }
                 **inner_position = u64::MAX;
 
-                #[cfg(feature="instrument")]
-                {self.count_write_calls += 1;}
+                #[cfg(feature = "instrument")]
+                {
+                    self.count_write_calls += 1;
+                }
                 inner.write_all(data)?;
 
                 **inner_position = checked_add(offset, data.len())?;
@@ -908,7 +938,7 @@ fn increment_pos(position: &mut u64, buflen: usize) -> std::io::Result<()> {
 /// We need to skip this in mutants testing, because this is used in for loops
 /// to make progress, causing them to never complete otherwise.
 #[cfg_attr(test, mutants::skip)]
-fn increment_pos_usize(position: &mut usize, buflen: usize){
+fn increment_pos_usize(position: &mut usize, buflen: usize) {
     *position += buflen;
 }
 #[inline(always)]
@@ -1216,7 +1246,7 @@ mod tests {
     #[cfg(feature = "instrument")]
     fn seeks_are_counted() {
         let mut cut_inner = FakeStream::default();
-        cut_inner.buf = vec![1,2,3];
+        cut_inner.buf = vec![1, 2, 3];
         let mut cut = BufStream::with_capacity(cut_inner, 100).unwrap();
 
         cut.seek(SeekFrom::Start(0)).unwrap();
@@ -1340,24 +1370,12 @@ mod tests {
     }
     #[test]
     fn stream_position_logic() {
-        assert_eq!(
-            check_stream_position(1,1),
-            true);
-        assert_eq!(
-            check_stream_position(2,1),
-            false);
-        assert_eq!(
-            check_stream_position(1,u64::MAX),
-            false);
-        assert_eq!(
-            check_stream_position(u64::MAX,u64::MAX),
-            false);
-        assert_eq!(
-            check_stream_position(u64::MAX,u64::MAX-1),
-            false);
-        assert_eq!(
-            check_stream_position(u64::MAX-1,u64::MAX-1),
-            true);
+        assert_eq!(check_stream_position(1, 1), true);
+        assert_eq!(check_stream_position(2, 1), false);
+        assert_eq!(check_stream_position(1, u64::MAX), false);
+        assert_eq!(check_stream_position(u64::MAX, u64::MAX), false);
+        assert_eq!(check_stream_position(u64::MAX, u64::MAX - 1), false);
+        assert_eq!(check_stream_position(u64::MAX - 1, u64::MAX - 1), true);
     }
 
     #[test]
@@ -1566,13 +1584,13 @@ mod tests {
                     if bufread {
                         if small_rng.gen_bool(0.5) {
                             cut_got = catch(&mut || {
-                                let len = cut.with_bytes(read_bytes, |idata|{
+                                let len = cut.with_bytes(read_bytes, |idata| {
                                     cutbuf[0..idata.len()].copy_from_slice(idata);
                                     idata.len()
                                 })?;
                                 Ok(len)
                             });
-                        } else  {
+                        } else {
                             cut_got = catch(&mut || {
                                 let cutbuflen = cutbuf.len();
                                 let fillbuf = cut.fill_buf()?;
@@ -1672,7 +1690,7 @@ mod tests {
             debug_println!("Cut state: {:?}", cut);
             assert_eq!(cut.buffer.data.capacity(), buffer_size);
 
-            #[cfg(feature="instrument")]
+            #[cfg(feature = "instrument")]
             {
                 assert_eq!(cut.inner.write_calls, cut.count_write_calls, "write count");
                 assert_eq!(cut.inner.read_calls, cut.count_read_calls, "read count");
@@ -1683,7 +1701,6 @@ mod tests {
             cut_cloned.flush().unwrap();
             assert_eq!(&good.buf, &cut_cloned.inner.buf);
             assert_eq!(&good.position, &(cut_cloned.position as usize));
-
 
             assert_eq!(cut_cloned.buffer.data.capacity(), buffer_size);
         }
@@ -1777,7 +1794,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature="instrument")]
+    #[cfg(feature = "instrument")]
     fn instrument_counts_flushes() {
         let cut_inner = FakeStream::default();
         let mut cut = BufStream::new(cut_inner).unwrap();
@@ -1788,7 +1805,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature="instrument")]
+    #[cfg(feature = "instrument")]
     fn test_buffer_seek_only_when_needed() {
         let cut_inner = FakeStream::default();
         let mut cut = BufStream::with_capacity(cut_inner, 1000).unwrap();
@@ -1797,10 +1814,10 @@ mod tests {
             let pos = cut.stream_position().unwrap();
             cut.write_zeroes(32).unwrap();
 
-            cut.write(&[42u8;200]).unwrap();
+            cut.write(&[42u8; 200]).unwrap();
             let end = cut.stream_position().unwrap();
             cut.seek(SeekFrom::Start(pos)).unwrap();
-            cut.write(&[43;32]).unwrap();
+            cut.write(&[43; 32]).unwrap();
 
             cut.seek(SeekFrom::Start(end)).unwrap();
             cut.flush_if(700, true).unwrap();
@@ -1812,12 +1829,12 @@ mod tests {
     #[test]
     fn repeated_short_reads_are_handled() {
         let mut cut_inner = FakeStream::default();
-        cut_inner.buf.resize(100,42);
+        cut_inner.buf.resize(100, 42);
         cut_inner.short_read_by = 1000;
         let mut cut = BufStream::with_capacity(cut_inner, 1000).unwrap();
-        let mut buf = [0u8;100];
+        let mut buf = [0u8; 100];
         cut.read_exact(&mut buf).unwrap();
-        #[cfg(feature="instrument")]
+        #[cfg(feature = "instrument")]
         {
             assert_eq!(cut.count_read_calls, 100);
         }
@@ -1826,11 +1843,11 @@ mod tests {
     #[test]
     fn repeated_short_reads_are_handled_with_bytes() {
         let mut cut_inner = FakeStream::default();
-        cut_inner.buf.resize(100,42);
+        cut_inner.buf.resize(100, 42);
         cut_inner.short_read_by = 1000;
         let mut cut = BufStream::with_capacity(cut_inner, 1000).unwrap();
-        cut.with_bytes(100,|_|{}).unwrap();
-        #[cfg(feature="instrument")]
+        cut.with_bytes(100, |_| {}).unwrap();
+        #[cfg(feature = "instrument")]
         {
             assert_eq!(cut.count_read_calls, 100);
         }
@@ -1839,16 +1856,13 @@ mod tests {
     #[test]
     fn repeated_short_reads_are_handled_with_bytes_big() {
         let mut cut_inner = FakeStream::default();
-        cut_inner.buf.resize(200,42);
+        cut_inner.buf.resize(200, 42);
         cut_inner.short_read_by = 1000;
         let mut cut = BufStream::with_capacity(cut_inner, 1).unwrap();
-        cut.with_bytes(100,|_|{}).unwrap();
-        #[cfg(feature="instrument")]
+        cut.with_bytes(100, |_| {}).unwrap();
+        #[cfg(feature = "instrument")]
         {
             assert_eq!(cut.count_read_calls, 100);
         }
     }
-
-
-
 }
