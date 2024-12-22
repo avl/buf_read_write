@@ -1836,6 +1836,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repeated_short_reads_are_handled_with_bytes_big() {
+        let mut cut_inner = FakeStream::default();
+        cut_inner.buf.resize(200,42);
+        cut_inner.short_read_by = 1000;
+        let mut cut = BufStream::with_capacity(cut_inner, 1).unwrap();
+        cut.with_bytes(100,|_|{}).unwrap();
+        #[cfg(feature="instrument")]
+        {
+            assert_eq!(cut.count_read_calls, 100);
+        }
+    }
+
 
 
 }

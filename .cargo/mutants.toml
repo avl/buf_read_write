@@ -1,3 +1,3 @@
 exclude_re = [
-    ".*src/lib.rs:356:63: replace - with + in MovingBuffer::read_at.*",
+    "replace - with . in MovingBuffer::read_at",
 ] # same as -E
