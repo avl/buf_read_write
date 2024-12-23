@@ -362,6 +362,7 @@ impl MovingBuffer {
                 let start = self.data.len();
                 let dropguard = DropGuard(&mut self.data, start);
                 let newsize = start + complementary_bytes;
+
                 dropguard.0.resize(newsize, 0);
                 let got = read_at(self.offset + start as u64, &mut dropguard.0[start..])?;
                 dropguard.0.truncate(start + got);
@@ -799,6 +800,24 @@ fn is_zero(value: usize) -> bool {
 }
 
 impl<T: Read + Seek + Write> BufStream<T> {
+
+
+    /// Copy `count` bytes from this object to the `other` object.
+    /// This will retry on short reads.
+    #[cfg_attr(test, mutants::skip)]
+    pub fn copy_to(&mut self, mut count: usize, mut other: impl Write) -> std::io::Result<()> {
+        let cap = self.buffer.data.capacity();
+        while count > 0 {
+            let copynow = count.min(cap);
+            self.with_bytes(copynow, |src_bytes|{
+                other.write_all(src_bytes)
+            })??;
+            count -= copynow;
+        }
+
+        Ok(())
+    }
+
     /// Call the given closure with 'count' bytes of from the file at the curren position.
     ///
     /// If possible, this request will be satisfied from bytes within the buffer.

@@ -1,3 +1,3 @@
 exclude_re = [
     "replace - with . in MovingBuffer::read_at",
-] # same as -E
+]
