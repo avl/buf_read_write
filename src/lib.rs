@@ -647,6 +647,12 @@ impl BufStream<File> {
         self.flush()?;
         self.inner.sync_all()
     }
+    /// Flush the buffer, then call the underlying [`File::set_len`].
+    #[cfg_attr(test, mutants::skip)] // Very hard to test, sync_all is only needed in special cases
+    pub fn set_len(&mut self, new_len: u64) -> std::io::Result<()> {
+        self.flush()?;
+        self.inner.set_len(new_len)
+    }
 }
 
 impl<T: Write + Seek> Drop for BufStream<T> {
@@ -800,8 +806,6 @@ fn is_zero(value: usize) -> bool {
 }
 
 impl<T: Read + Seek + Write> BufStream<T> {
-
-
     /// Copy `count` bytes from this object to the `other` object.
     /// This will retry on short reads.
     #[cfg_attr(test, mutants::skip)]
@@ -809,9 +813,7 @@ impl<T: Read + Seek + Write> BufStream<T> {
         let cap = self.buffer.data.capacity();
         while count > 0 {
             let copynow = count.min(cap);
-            self.with_bytes(copynow, |src_bytes|{
-                other.write_all(src_bytes)
-            })??;
+            self.with_bytes(copynow, |src_bytes| other.write_all(src_bytes))??;
             count -= copynow;
         }
 
