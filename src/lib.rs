@@ -662,6 +662,50 @@ impl<T: Write + Seek> Drop for BufStream<T> {
 }
 
 impl<T: Write + Seek> BufStream<T> {
+
+
+    /// Gives access to the inner type.
+    ///
+    /// This does not flush the buffer. It does not alter the file position (though the actual
+    /// file position is not easily predictable due to the buffering of BufStream).
+    ///
+    /// Warning! The inner instance can be used for calling
+    /// things such as `File::sync_all`, create mmaps or other operations that require access
+    /// to the backing implementation. The returned instance must *NOT* be written to, read from
+    /// or have any action performed that affects the current seek position.
+    #[cfg_attr(test, mutants::skip)] // Very hard to test, sync_all is only needed in special cases
+    pub fn inner_unchecked(&self) -> &T {
+        &self.inner
+    }
+    /// Gives mutable access to the inner type.
+    ///
+    /// This does not flush the buffer. It does not alter the file position (though the actual
+    /// file position is not easily predictable due to the buffering of BufStream).
+    ///
+    /// Warning! The inner instance can be used for calling
+    /// things such as `File::sync_all`, create mmaps or other operations that require access
+    /// to the backing implementation. The returned instance must *NOT* be written to, read from
+    /// or have any action performed that affects the current seek position.
+    #[cfg_attr(test, mutants::skip)] // Very hard to test, sync_all is only needed in special cases
+    pub fn inner_unchecked_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+
+    /// Returns the inner instance.
+    ///
+    /// Flushes the buffer, and seeks the file to position 0.
+    ///
+    /// This requires `&mut self` because of the need to mark the inner file position as
+    /// invalid, since the returned instance can have its position updated freely.
+    #[cfg_attr(test, mutants::skip)] // Very hard to test, sync_all is only needed in special cases
+    pub fn inner_checked(&mut self) -> std::io::Result<&mut T> {
+        self.flush_write()?;
+        self.seek(SeekFrom::Start(0))?;
+        self.inner_position = u64::MAX;
+        Ok(&mut self.inner)
+    }
+
+
     fn flush_write(&mut self) -> Result<(), std::io::Error> {
         let t = self.buffer.flush(&mut |offset, data| {
             if !check_stream_position(self.inner_position, offset) {
